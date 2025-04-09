@@ -18,13 +18,13 @@ def load_config() -> Dict[str, Optional[str]]:
         "aws_region": os.getenv("AWS_REGION", "us-east-2"),
         "s3_bucket_name": os.getenv("S3_BUCKET_NAME"),
         "pinecone_api_key": os.getenv("PINECONE_API_KEY"),
-        "pinecone_environment": os.getenv("PINECONE_ENVIRONMENT"),
         "openai_api_key": os.getenv("OPENAI_API_KEY"),
         "google_api_key": os.getenv("GOOGLE_API_KEY"), # Or handle GOOGLE_APPLICATION_CREDENTIALS
         "perplexity_api_key": os.getenv("PERPLEXITY_API_KEY"),
+        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),
         # Add direct AWS keys only if absolutely needed (prefer IAM roles)
-        # "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
-        # "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
     }
     # Basic validation (add more as needed)
     if not config["s3_bucket_name"]:
