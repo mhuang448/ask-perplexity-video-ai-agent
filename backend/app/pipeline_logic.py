@@ -11,8 +11,6 @@ from .models import VideoMetadata, Interaction # Import Pydantic models for stru
 # Placeholder imports for AI clients - replace with actual imports
 # import pinecone
 # import openai
-# from google.cloud import aiplatform
-# from perplexity_mcp_client import PerplexityClient
 
 # --- S3 JSON Read/Write Helpers (Crucial for State) ---
 
