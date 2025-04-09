@@ -3,3 +3,5 @@
 .cursorignore
 
 .DS_Store
+
+deprecated/
