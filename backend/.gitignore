@@ -1,1 +1,10 @@
 .env
+
+processed-videos/
+
+processed-videos/
+
+venv/
+
+__pycache__/
+*.pyc

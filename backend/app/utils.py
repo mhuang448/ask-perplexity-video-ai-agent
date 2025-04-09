@@ -18,6 +18,7 @@ def load_config() -> Dict[str, Optional[str]]:
         "aws_region": os.getenv("AWS_REGION", "us-east-2"),
         "s3_bucket_name": os.getenv("S3_BUCKET_NAME"),
         "pinecone_api_key": os.getenv("PINECONE_API_KEY"),
+        "pinecone_index_host": os.getenv("PINECONE_INDEX_HOST"),
         "openai_api_key": os.getenv("OPENAI_API_KEY"),
         "google_api_key": os.getenv("GOOGLE_API_KEY"), # Or handle GOOGLE_APPLICATION_CREDENTIALS
         "perplexity_api_key": os.getenv("PERPLEXITY_API_KEY"),
@@ -50,8 +51,8 @@ def get_s3_client():
             # aws_secret_access_key=CONFIG["aws_secret_access_key"],
         )
         # Test connection briefly (optional)
-        s3_client.list_buckets()
-        print("S3 Client Initialized Successfully.")
+        buckets = s3_client.list_buckets()['Buckets']
+        print(f"S3 Client Initialized Successfully. Buckets: {buckets}")
         return s3_client
     except (NoCredentialsError, PartialCredentialsError):
         print("ERROR: AWS credentials not found. Configure AWS CLI, IAM Role, or environment variables.")
