@@ -16,4 +16,4 @@ google-genai
 pinecone[grpc]
 openai
 
-re
+mcp

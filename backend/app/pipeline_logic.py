@@ -1,6 +1,8 @@
 # app/pipeline_logic.py
 import time
 import json
+import asyncio # Added for MCP async operations
+from contextlib import AsyncExitStack # Added for MCP connection management
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 from typing import List, Dict, Any, Tuple, Optional # Added List, Dict, Any, Tuple, Optional
@@ -8,13 +10,20 @@ from typing import List, Dict, Any, Tuple, Optional # Added List, Dict, Any, Tup
 # Import helper functions and clients from utils
 from .utils import (
     S3_CLIENT, CONFIG, get_s3_json_path, get_s3_interactions_path,
-    OPENAI_CLIENT, PINECONE_INDEX # Added OpenAI and Pinecone clients
+    OPENAI_CLIENT, PINECONE_INDEX,
+    ANTHROPIC_CLIENT, # Added Anthropic client (optional)
+    get_mcp_server_params # Added MCP helper
 )
 from .models import VideoMetadata, Interaction # Import Pydantic models for structure
 
 # Import specific exceptions for better handling
 from openai import OpenAIError
 from pinecone.exceptions import PineconeException
+# Import MCP components
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client
+# Import Anthropic specific exceptions
+from anthropic import APIError as AnthropicAPIError
 
 # Placeholder imports for AI clients - replace with actual imports
 # import pinecone
@@ -329,7 +338,7 @@ def _retrieve_relevant_chunks(video_id: str, user_query: str, top_k: int = 3) ->
         # Return empty list on general error
         return []
 
-def _assemble_context(retrieved_chunks: List[Dict[str, Any]], video_metadata: Dict[str, Any]) -> str:
+def _assemble_video_context(retrieved_chunks: List[Dict[str, Any]], video_metadata: Dict[str, Any]) -> str:
     """Assembles the context string from retrieved chunks and video metadata."""
     print("Assembling context...")
     
@@ -397,37 +406,312 @@ def _assemble_context(retrieved_chunks: List[Dict[str, Any]], video_metadata: Di
             if i < len(retrieved_chunks) - 1:
                 context_parts.append("---")
 
-    final_context = "\n".join(context_parts)
-    print(f"Context assembly complete. Final context length: {len(final_context)}")
-    return final_context
+    video_context = "\n".join(context_parts)
+    print(f"Video context assembly complete. Final video context length: {len(video_context)}")
+    return video_context
 
-# --- Placeholder Functions for Downstream Steps ---
+def _assemble_intermediate_prompt(video_context: str, query: str) -> str:
+    """Assembles the intermediate prompt for our MCP Client to send to the MCP server."""
+    intermediate_prompt = f"""
+**Context for Query Processing:**
 
-def _call_mcp(context: str, user_query: str):
-    print("Placeholder: Calling Perplexity MCP...")
-    time.sleep(4) # Simulate MCP call
-    # TODO: Implement MCP client interaction
-    #   - Choose tool (rule-based or Claude-orchestrated)
-    #   - Call session.call_tool
-    mcp_result = "This is a placeholder result from MCP."
-    print("Placeholder: MCP call complete.")
-    return mcp_result
+A user is asking a question about a video. This video context details specific observations from the video—including described entities, actions, dialogue, sounds, visuals, and overall themes. The information in video context may useful to fully and best address the user query.
 
-def _synthesize_answer(context: str, mcp_result: str, user_query: str) -> str:
-    print("Placeholder: Synthesizing final answer...")
-    time.sleep(3) # Simulate final LLM call
-    # TODO: Implement final answer synthesis
-    #   - Construct prompt for OpenAI completion model (gpt-4o-mini)
-    #   - Include original query, video context, MCP result
-    #   - Call OpenAI API
-    final_answer = f"Placeholder answer for '{user_query}' based on context and MCP."
-    print("Placeholder: Synthesis complete.")
-    return final_answer
+---
+
+**User Query:**
+{query}
+
+---
+
+**Video Context:**
+{video_context}
+---
+""" 
+    return intermediate_prompt
+
+# --- MCP Interaction & Answer Synthesis --- (Integrated from mcp_client.py)
+
+# Rule-based tool selection logic (adapted from mcp_client.py)
+def _select_perplexity_tool_rule_based(query: str) -> str:
+    """Selects the appropriate Perplexity tool based on the query content using heuristics."""
+    query_lower = query.lower()
+    research_keywords = [
+        'research', 'analyze', 'study', 'investigate', 'comprehensive', 'detailed',
+        'in-depth', 'thorough', 'scholarly', 'academic', 'compare', 'contrast',
+        'literature', 'history of', 'development of', 'evidence', 'sources',
+        'references', 'citations', 'papers'
+    ]
+    deep_research_keywords = ['Deep Research', 'DeepResearch']
+    reasoning_keywords = [
+        'why', 'how', 'how does', 'explain', 'reasoning', 'logic', 'analyze', 'solve',
+        'problem', 'prove', 'calculate', 'evaluate', 'assess', 'implications',
+        'consequences', 'effects of', 'causes of', 'steps to', 'method for',
+        'approach to', 'strategy', 'solution'
+    ]
+
+    is_long_query = len(query.split()) > 50
+    research_score = sum(1 for keyword in research_keywords if keyword in query_lower)
+    deep_research_score = sum(1 for keyword in deep_research_keywords if keyword in query_lower)
+    reasoning_score = sum(1 for keyword in reasoning_keywords if keyword in query_lower)
+
+    if is_long_query: research_score += 1
+    if query_lower.startswith(('why', 'how')) and len(query_lower.split()) > 5: reasoning_score += 1
+
+    if deep_research_score >= 1 or research_score >= 3 or (research_score >= 2 and is_long_query):
+        print("  Rule-based selection: perplexity_research")
+        return "perplexity_research"
+    elif reasoning_score >= 2:
+        print("  Rule-based selection: perplexity_reason")
+        return "perplexity_reason"
+    else:
+        print("  Rule-based selection: perplexity_ask (default)")
+        return "perplexity_ask"
+
+# LLM-based tool selection and execution logic
+async def _select_and_run_tool_llm_based(
+    session: ClientSession,
+    query_context: str,
+    anthropic_client: Any # Should be Anthropic client instance
+) -> str:
+    """Uses Claude to select an MCP tool, determine args, execute it, and return the text result."""
+    if not anthropic_client:
+        print("  ERROR: Anthropic client not available for LLM-based tool selection.")
+        return "[Error: Anthropic client not configured]"
+
+    tool_result_text = "[LLM did not select or run a tool]" # Default if no tool use happens
+
+    try:
+        # 1. Get available tools from the MCP session
+        print("  Listing tools for LLM selection...")
+        list_response = await session.list_tools()
+        available_tools = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema
+            }
+            for tool in list_response.tools
+        ]
+        if not available_tools:
+            print("  Warning: No tools available from MCP server.")
+            return "[Error: No tools available from MCP server]"
+        print(f"  Found tools: {[t['name'] for t in available_tools]}")
+
+        # 2. Call Anthropic API to get tool selection and arguments
+        messages = [{"role": "user", "content": query_context}]
+        print("  Sending query and tools to Anthropic for selection...")
+        claude_response = anthropic_client.messages.create(
+            model="claude-3-7-sonnet-20250219", # Use the specified model
+            max_tokens=1000,
+            messages=messages,
+            tools=available_tools,
+            tool_choice={"type": "any"} # Force Claude to select a tool
+        )
+
+        # 3. Process Claude's response - looking specifically for tool_use
+        tool_called = False
+        if claude_response.content:
+            for content_block in claude_response.content:
+                if content_block.type == 'tool_use':
+                    tool_name = content_block.name
+                    tool_args = content_block.input
+                    tool_use_id = content_block.id
+                    print(f"  LLM selected tool: '{tool_name}' with args: {tool_args}")
+                    tool_called = True
+
+                    # 4. Execute the selected tool via MCP session
+                    print(f"  Calling tool '{tool_name}' via MCP...")
+                    tool_call_start = time.time()
+                    try:
+                        tool_exec_result = await session.call_tool(tool_name, tool_args)
+                        tool_call_end = time.time()
+                        print(f"  Tool call finished in {tool_call_end - tool_call_start:.2f} seconds.")
+
+                        # 5. Extract text content from the tool execution result
+                        current_tool_text = ""
+                        if tool_exec_result and tool_exec_result.content:
+                            for part in tool_exec_result.content:
+                                if hasattr(part, 'type') and part.type == 'text' and hasattr(part, 'text'):
+                                    current_tool_text += part.text + "\n"
+                            tool_result_text = current_tool_text.strip()
+                            print(f"  Received text result from '{tool_name}' (length: {len(tool_result_text)} chars).")
+                        else:
+                            print(f"  Warning: Tool '{tool_name}' returned no content.")
+                            tool_result_text = f"[Tool '{tool_name}' returned no information]"
+
+                    except Exception as e:
+                        print(f"  Unexpected ERROR calling tool '{tool_name}': {e}")
+                        tool_result_text = f"[Unexpected error executing tool '{tool_name}']"
+
+                    # Assuming we only process the first tool call requested by Claude in this pass
+                    break # Exit loop after handling the first tool_use block
+
+            if not tool_called:
+                 print("  LLM did not request any tool calls.")
+                 # tool_result_text remains as the default message
+
+    except AnthropicAPIError as ae:
+        print(f"  ERROR: Anthropic API error during tool selection: {ae}")
+        tool_result_text = f"[Error interacting with Anthropic API: {ae}]"
+    except Exception as e:
+        print(f"  ERROR: Unexpected error during LLM tool selection/execution: {e}")
+        tool_result_text = f"[Unexpected error during LLM-based tool process: {e}]"
+
+    return tool_result_text
+
+async def _call_mcp(
+    intermediate_prompt: str,
+    mcp_server_name: str = "perplexity-ask",
+    use_llm_selection: bool = True # Default to LLM-based selection
+) -> str:
+    """Connects to a specified MCP server (via stdio), selects and calls a tool
+       (either rule-based or LLM-based), and returns the text result.
+       
+       WARNING: Uses stdio_client, suitable for local testing but NOT recommended for production.
+    """
+    print(f"Calling MCP server '{mcp_server_name}' (LLM Selection: {use_llm_selection})...")
+    server_params = get_mcp_server_params(mcp_server_name)
+    if not server_params:
+        raise ValueError(f"MCP Server configuration '{mcp_server_name}' not found or invalid.")
+
+    mcp_result_text = "" # Initialize
+
+    try:
+        async with AsyncExitStack() as stack:
+            print(f"  Connecting to MCP server process: {server_params.command} {server_params.args}")
+            # PRODUCTION NOTE: Use network client in production
+            stdio_transport = await stack.enter_async_context(stdio_client(server_params))
+            stdio, write = stdio_transport
+            session = await stack.enter_async_context(ClientSession(stdio, write))
+
+            await session.initialize()
+            print("  MCP session initialized.")
+
+            if use_llm_selection:
+                # --- LLM-Based Tool Selection --- 
+                mcp_result_text = await _select_and_run_tool_llm_based(
+                    session,
+                    intermediate_prompt, # Pass the combined query + video context
+                    ANTHROPIC_CLIENT
+                )
+            else:
+                # --- Rule-Based Tool Selection (Existing Logic) --- 
+                selected_tool = _select_perplexity_tool_rule_based(intermediate_prompt)
+                print(f"  Calling tool '{selected_tool}' via MCP (rule-based selection)...")
+                tool_call_start = time.time()
+                try:
+                    tool_args = {"messages": [{"role": "user", "content": intermediate_prompt}]}
+                    result = await session.call_tool(selected_tool, tool_args)
+                    tool_call_end = time.time()
+                    print(f"  Tool call finished in {tool_call_end - tool_call_start:.2f} seconds.")
+                    
+                    # Extract text content
+                    current_tool_text = ""
+                    if result and result.content:
+                        for part in result.content:
+                            if hasattr(part, 'type') and part.type == 'text' and hasattr(part, 'text'):
+                                current_tool_text += part.text + "\n"
+                        mcp_result_text = current_tool_text.strip()
+                        print(f"  Received text result from '{selected_tool}' (length: {len(mcp_result_text)} chars).")
+                    else:
+                        print(f"  Warning: Tool '{selected_tool}' returned no content.")
+                        mcp_result_text = f"[Tool '{selected_tool}' returned no information]"
+                except Exception as e:
+                    print(f"  Unexpected ERROR calling tool '{selected_tool}': {e}")
+                    mcp_result_text = f"[Unexpected error executing tool '{selected_tool}']"
 
 
-# --- Background Task Implementations --- (Updated to use integrated functions)
+    except asyncio.TimeoutError:
+        print("  ERROR: Timeout connecting to or calling MCP server.")
+        mcp_result_text = "[Error: Timeout interacting with MCP server]"
+    except FileNotFoundError:
+        print(f"  ERROR: MCP server command '{server_params.command}' not found. Is Docker running/installed?")
+        mcp_result_text = f"[Error: MCP server command not found]"
+    except Exception as e:
+        print(f"  ERROR: Unexpected error during MCP interaction: {e}")
+        mcp_result_text = f"[Unexpected error interacting with MCP server: {e}]"
 
-def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str, query_timestamp: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str):
+    print(f"MCP call complete for server '{mcp_server_name}'.")
+    return mcp_result_text
+
+def _synthesize_answer(user_query: str, video_context: str, mcp_result: str) -> str:
+    """Synthesizes the final answer using OpenAI, combining the original query,
+       video context (already included in full_context), and the MCP result.
+    """
+    print("Synthesizing final answer using OpenAI...")
+    if not OPENAI_CLIENT:
+        print("ERROR: OpenAI client not initialized. Cannot synthesize answer.")
+        return "[Error: OpenAI client not available for synthesis]"
+
+    synthesis_model = CONFIG.get("openai_synthesis_model", "gpt-4o-mini")
+
+    # Construct the prompt for the synthesis model
+    # The `full_context` variable already contains the User Query, Video Summary, Themes, and Relevant Clips.
+    # We just need to add the MCP result as Additional Information.
+    # Modify this prompt structure as needed for optimal results.
+    prompt = f"""
+**Task:**
+Please answer the user query comprehensively by synthesizing relevant information from **both** the Video Context (details extracted directly from the video) and the relevant Internet Search Results provided below.
+
+**Instructions:**
+1.  Analyze the User Query embedded within the Video Context to understand the core question.
+2.  Review the Video Context (summary, themes, specific segments) for information directly observable in the video.
+3.  Review the Internet Search Results for broader context, facts, or related information.
+4.  Formulate a cohesive answer that integrates relevant details from both sources.
+5.  Prioritize information from the Video Context when the query pertains to specific events or details *within* the video itself.
+6.  Use the Internet Search Results to enrich the answer, provide background, clarify concepts, or address aspects of the query not covered by the video context alone.
+7.  If the combined information is insufficient to answer the query fully, state what information is available and what is missing. Do not speculate beyond the provided contexts.
+8.  Provide a clear and concise answer. Do not include citations.
+
+---
+
+**User Query:**
+{user_query}
+
+---
+
+**Video Context (Includes User Query):**
+{video_context}
+
+---
+
+**Internet Search Results (from Perplexity):**
+{mcp_result}
+
+---
+
+**Final Answer:**
+"""
+
+    print(f"  Sending synthesis prompt to OpenAI model: {synthesis_model}")
+    synthesis_start = time.time()
+    try:
+        completion = OPENAI_CLIENT.chat.completions.create(
+            model=synthesis_model,
+            messages=[
+                # Note: Providing the entire combined text as a single user message.
+                # You could experiment with different roles or structuring if needed.
+                {"role": "user", "content": prompt}
+            ]
+        )
+        final_answer = completion.choices[0].message.content
+        synthesis_end = time.time()
+        print(f"  OpenAI synthesis successful in {synthesis_end - synthesis_start:.2f} seconds.")
+        return final_answer.strip() if final_answer else "[OpenAI returned an empty answer]"
+
+    except OpenAIError as e:
+        print(f"  ERROR during OpenAI synthesis: {e}")
+        return f"[Error synthesizing answer using OpenAI: {e}]"
+    except Exception as e:
+        print(f"  Unexpected ERROR during OpenAI synthesis: {e}")
+        return f"[Unexpected error during answer synthesis: {e}]"
+
+
+
+# --- Background Task Implementations --- (Updated)
+
+async def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str, query_timestamp: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str):
     """Background task to answer a query for a PROCESSED video."""
     print(f"BACKGROUND TASK: Starting query pipeline for interaction {interaction_id} on video {video_id}")
     start_time = time.time()
@@ -442,35 +726,37 @@ def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str
         }
         add_interaction_to_s3(s3_bucket, s3_interactions_path, interaction)
 
-        # 2. Load full video metadata (needed for context assembly)
-        # Note: get_processing_status_from_s3 reads the *full* metadata file
+        # 2. Load full video metadata
         video_metadata = get_video_metadata_from_s3(s3_bucket, s3_json_path)
-        print(f"===============\nVIDEO METADATA:\n{video_metadata}\n================")
-        # summary = video_metadata.get("overall_summary", "Summary not found.") # Extracted within _assemble_context
-        # themes = video_metadata.get("key_themes", []) # Extracted within _assemble_context
+        print(f"===============\nVIDEO METADATA LOADED\n===============")
 
         # 3. Retrieve relevant chunks from Pinecone
-        # Use video_id (which should match the one used during indexing)
         retrieved_chunks = _retrieve_relevant_chunks(video_id, user_query)
-        print(f"===============\nRETRIEVED CHUNKS:\n{retrieved_chunks}\n================")
+        print(f"===============\nRETRIEVED {len(retrieved_chunks)} CHUNKS\n===============")
 
-        # 4. Assemble context using retrieved chunks and full metadata
-        context = _assemble_context(retrieved_chunks, video_metadata)
-        print(f"===============\nCONTEXT:\n{context}\n================")
-        # 5. Call MCP tool
-        mcp_result = _call_mcp(context, user_query)
-        print(f"===============\nMCP RESULT:\n{mcp_result}\n================")
-        # 6. Synthesize final answer
-        final_answer = _synthesize_answer(context, mcp_result, user_query)
-        print(f"===============\nFINAL ANSWER:\n{final_answer}\n================")
+        # 4. Assemble context (This now includes summary, themes, clips)
+        # Prepend the original user query for clarity in the combined context
+        video_context = _assemble_video_context(retrieved_chunks, video_metadata)
+        intermediate_prompt = _assemble_intermediate_prompt(video_context, user_query)
+        print(f"===============\nINTERMEDIATE PROMPT:\n{intermediate_prompt[:500]}...\n===============")
+        
+        # 5. Call MCP tool (using the assembled context + query)
+        # Decide here whether to use LLM selection or rule-based
+        # For now, let's keep the default (use_llm_selection=False in _call_mcp)
+        mcp_result = await _call_mcp(intermediate_prompt) 
+        print(f"===============\nMCP TOOL RESULT:\n{mcp_result}\n===============")
+        
+        # 6. Synthesize final answer (using the original context, MCP result, and query)
+        final_answer = _synthesize_answer(user_query, video_context, mcp_result)
+        print(f"===============\nFINAL ANSWER:\n{final_answer[:500]}...\n===============")
         
         # 7. Update status to completed with the answer
-        # update_interaction_status_in_s3(
-        #     s3_bucket, s3_interactions_path, interaction_id, "completed",
-        #     final_answer=final_answer,
-        #     answer_timestamp=datetime.now(timezone.utc).isoformat()
-        # )
-        # print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} COMPLETED.")
+        update_interaction_status_in_s3(
+            s3_bucket, s3_interactions_path, interaction_id, "completed",
+            final_answer=final_answer,
+            answer_timestamp=datetime.now(timezone.utc).isoformat()
+        )
+        print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} COMPLETED.")
 
     except Exception as e:
         print(f"BACKGROUND TASK ERROR: Query pipeline for interaction {interaction_id} FAILED: {e}")
@@ -484,14 +770,14 @@ def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str
         print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} finished in {end_time - start_time:.2f} seconds.")
 
 
-def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_video_base_path: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str, interaction_id: str, query_timestamp: str):
+async def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_video_base_path: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str, interaction_id: str, query_timestamp: str):
     """Background task to process a NEW video and then answer a query."""
     print(f"BACKGROUND TASK: Starting full pipeline for {video_id} with interaction {interaction_id}")
     start_time = time.time()
-    full_video_metadata = None # Initialize variable to store the complete metadata
+    full_video_metadata = None
 
     try:
-        # 1. Create initial metadata file with PROCESSING status
+        # 1. Create initial metadata file
         initial_metadata = {
             "video_id": video_id,
             "source_url": video_url,
@@ -506,7 +792,7 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
         )
         print(f"Created initial metadata at s3://{s3_bucket}/{s3_json_path}")
         
-        # 2. Add initial interaction with processing status
+        # 2. Add initial interaction
         interaction = {
             "interaction_id": interaction_id,
             "user_query": user_query,
@@ -544,19 +830,22 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
         )
         print(f"Updated metadata with status FINISHED at s3://{s3_bucket}/{s3_json_path}")
 
-        # --- Handle the Query --- (Now uses the integrated functions)
-        
-        # Retrieve relevant chunks using the completed video_id and user query
+        # --- Handle the Query --- 
+        # Retrieve relevant chunks
         retrieved_chunks = _retrieve_relevant_chunks(video_id, user_query)
         
-        # Assemble context using retrieved chunks and the *full* metadata we just saved
-        context = _assemble_context(retrieved_chunks, full_video_metadata)
+        # Assemble video context and intermediate prompt
+        video_context = _assemble_video_context(retrieved_chunks, full_video_metadata)
+        intermediate_prompt = _assemble_intermediate_prompt(video_context, user_query)
+        print(f"Generated intermediate prompt (length: {len(intermediate_prompt)} chars)")
         
-        # Call MCP
-        mcp_result = _call_mcp(context, user_query)
+        # Call MCP (using default rule-based selection for now)
+        mcp_result = await _call_mcp(intermediate_prompt) 
+        print(f"Received MCP result (length: {len(mcp_result)} chars)")
         
         # Synthesize answer
-        final_answer = _synthesize_answer(context, mcp_result, user_query)
+        final_answer = _synthesize_answer(user_query, video_context, mcp_result)
+        print(f"Synthesized final answer (length: {len(final_answer)} chars)")
         
         # Update interaction status to completed
         update_interaction_status_in_s3(
