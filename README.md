@@ -7,20 +7,20 @@ https://www.perplexity.ai/hub/blog/rebuilding-tiktok-in-america
 
 ## Description
 
-This project demonstrates a TikTok-style video feed application where users can ask questions about the video content and receive AI-generated answers asynchronously.
+This project demonstrates a TikTok-style video feed application where users can ask questions about the video content and receive AI-generated answers asynchronously. Videos are processed and stored, allowing users to query them.
 
 ## Core Features
 
-- **Vertical Video Feed:** Displays a scrollable feed of short-form videos.
+- **Vertical Video Feed:** Displays a scrollable feed of videos whose data is already fully processed and stored (`processing_status` is `FINISHED`).
 - **Asynchronous Q&A:** Ask questions via comment that tag @AskPerplexity; user does not wait, keeps scrolling feed as normal, and gets notified when the AI answer is ready.
 - **RAG + MCP Pipeline:** Uses Retrieval-Augmented Generation (RAG) with Pinecone to augment user queries with relevant context from the video. Also leverages MCP to query Perplexity's Model Context Protocol (MCP) server for enhanced, context-aware answers.
 
 ## UX Flow Summary
 
-1.  **Launch:** User opens the app and sees the "For You" feed with a video playing.
-2.  **Browse:** User swipes/scrolls vertically through the initial videos.
-3.  **Ask:** User taps comment icon, types question, submits. The question appears immediately (optimistic UI). The app sends the request to the backend and the user continues browsing.
-4.  **Ask (New Video - Optional):** User navigates to "Process New Video", submits a TikTok URL + question. Processing starts in the background.
+1.  **Launch:** User opens the app and sees the "For You" feed with a video playing (sourced from videos marked as `FINISHED` in S3).
+2.  **Browse:** User swipes/scrolls vertically through the videos.
+3.  **Ask (Processed Video):** User taps comment icon on a video from the feed, types question, submits. The question appears immediately (optimistic UI). The app sends the request to the backend (`/api/query/async`) and the user continues browsing.
+4.  **Ask (New Video):** User navigates to "Process New Video", submits a TikTok URL + question. The backend (`/api/process_and_query/async`) creates metadata JSON with `processing_status: PROCESSING`, processes the video fully (download, analyze, store), handles the query, and finally updates `processing_status` to `FINISHED`. Processing happens in the background.
 5.  **Get Notified:** After background AI processing completes (seconds to minutes), a UI notification indicates an answer is ready.
 6.  **View:** User views the AI-generated answer as a reply in the comment section for the relevant video.
 
@@ -28,7 +28,10 @@ This project demonstrates a TikTok-style video feed application where users can 
 
 - **Frontend (Next.js on Vercel):** Handles UI, user interaction, calls Backend API.
 - **Backend (FastAPI on AWS App Runner):** Single API service in a Docker container. Handles requests, runs AI pipeline via background tasks.
-- **Storage (AWS S3):** Stores video files (`.mp4`) and JSON metadata files (captions, summaries, Q&A state/answers).
+- **Storage (AWS S3):** Stores video data under a `video-data/` prefix. Each processed video gets a dedicated folder `video-data/<video_id>/`. This folder contains:
+  - `<video_id>.json`: Metadata file holding video details (e.g., captions, summary, themes) and the overall `processing_status` (`PROCESSING` or `FINISHED`). This file is separate from interaction data to reduce concurrency issues.
+  - `interactions.json`: A separate file containing an array of user Q&A interactions. Created upon the first query to a video, and updated with each subsequent query. Each interaction includes the query, status (`processing`, `completed`, `failed`), AI answer, timestamps, and `interaction_id`. Keeping interactions separate from video metadata prevents conflicts when processing multiple queries simultaneously.
+- **Video ID Format:** Each video is uniquely identified by a `video_id` that combines the TikTok username and video ID from the URL, separated by a dash. For example, from the URL `https://www.tiktok.com/@aichifan33/video/7486040114695507242`, the `video_id` would be `aichifan33-7486040114695507242`.
 - **Vector DB (Pinecone):** Stores video caption embeddings for fast retrieval.
 - **AI Services:** Gemini (Captions), OpenAI (Embeddings, Synthesis), Perplexity (MCP - Reasoning/Search).
 
@@ -37,11 +40,11 @@ This project demonstrates a TikTok-style video feed application where users can 
 - **Technology:** FastAPI, Uvicorn, Docker, Boto3 (AWS SDK).
 - **Core Logic (`app/pipeline_logic.py`):** Contains functions for downloading, chunking, captioning (Gemini), summarizing (OpenAI), indexing (OpenAI Embeddings -> Pinecone), retrieving context (Pinecone), calling MCP (Perplexity), synthesizing answers (OpenAI).
 - **API Endpoints (`app/main.py`):**
-  - `GET /api/videos/foryou`: Provides initial pre-processed video URLs (from S3).
-  - `POST /api/query/async`: Triggers background task (query pipeline) for a pre-processed video Q&A. Returns immediately.
-  - `POST /api/process_and_query/async`: Triggers background task (full pipeline: download -> ... -> answer) for a new video URL + Q&A. Returns immediately.
-  - `GET /api/query/status/{video_id}`: Frontend polls this to get Q&A status and answers (reads from S3 JSON).
-- **State Management:** Q&A status (`processing`, `completed`, `failed`) and AI answers are stored within an `interactions` array inside the corresponding video's JSON metadata file on S3. Background tasks update this file.
+  - `GET /api/videos/foryou`: Provides video URLs for videos whose `<video_id>.json` file in S3 has `processing_status: FINISHED`.
+  - `POST /api/query/async`: Triggers a background task for an existing video (status `FINISHED`). The task adds/updates the query in `interactions.json` (creating the file if needed) and sets its status to `processing`. Returns immediately.
+  - `POST /api/process_and_query/async`: Creates the initial `<video_id>.json` with `processing_status: PROCESSING`. Triggers a background task for the full pipeline. This task also creates/updates `interactions.json` with the initial user query (status `processing`). After indexing, it updates `processing_status` to `FINISHED` in `<video_id>.json`. Finally, it updates the specific interaction's status in `interactions.json` upon completion/failure. Stores results under `video-data/<video_id>/`. Returns immediately.
+  - `GET /api/query/status/{video_id}`: Frontend polls this. Reads `<video_id>.json` for `processing_status` and `interactions.json` for the list of Q&A interactions.
+- **State Management:** Overall processing state (`processing_status`) is in `<video_id>.json`. Individual Q&A interaction states are managed within the array in `interactions.json`. Both are stored in S3 under `video-data/<video_id>/`. Background tasks update these files.
 - **Deployment:** Docker image built from `backend/Dockerfile`, pushed to AWS ECR, deployed via AWS App Runner (configured with environment variables for API keys/secrets and an IAM Role for S3 access). Requires CORS configuration to allow requests from the frontend domain.
 
 ## Frontend (Next.js / TypeScript)
@@ -58,7 +61,7 @@ This project demonstrates a TikTok-style video feed application where users can 
 ## Setup & Running (Quick Start)
 
 1.  **Prerequisites:** Ensure accounts/API keys for AWS, Pinecone, OpenAI, Google Cloud (Gemini), Perplexity. Install Node.js, Python, Docker, Git, AWS CLI.
-2.  **Pre-process Videos:** Manually run scripts to process 10 videos: Upload `.mp4` and `.json` (with empty `interactions`) to `s3://<your-bucket>/preprocessed/`, upload embeddings to Pinecone.
+2.  **Process Initial Videos:** Manually run scripts or use the process endpoint. Ensure for each video, `<video_id>.json` exists in `s3://<your-bucket>/video-data/<video_id>/` with `processing_status: FINISHED`. The `interactions.json` file should _not_ exist initially; it will be created upon the first query. Ensure chunk captions are indexed into Pinecone.
 3.  **Backend:**
     - `cd backend`
     - Create/populate `.env` with secrets for local testing.
@@ -71,10 +74,10 @@ This project demonstrates a TikTok-style video feed application where users can 
     - `npm install`
     - Local Test: `npm run dev` (ensure backend is running/deployed).
     - Deploy: Connect repo to Vercel, set Root Directory to `frontend`, configure `NEXT_PUBLIC_API_BASE_URL`.
-5.  **CORS:** Configure CORS on AWS S3 bucket (allow GET from frontend domain) and in backend FastAPI `main.py` (allow requests from frontend domain).
+5.  **CORS:** Configure CORS on AWS S3 bucket (allow GET from frontend domain for objects under `video-data/`) and in backend FastAPI `main.py` (allow requests from frontend domain).
 
 ## Key Trade-offs to prioritize speed of development (to be improved in future)
 
 - **Polling:** Frontend uses basic polling (`setInterval`) for status updates, less efficient than WebSockets.
-- **S3 JSON State:** Storing Q&A state in S3 JSON involves inefficient read-modify-write operations; DynamoDB would be better at scale.
-- **Background Tasks:** FastAPI's `BackgroundTasks` are simple but not persistent; server restarts lose running tasks. Celery/Redis would be more robust.
+- **S3 JSON State:** Storing state in S3 JSON involves read-modify-write. Separating interactions helps, but DynamoDB would still be more robust for frequent interaction updates.
+- **Background Tasks:** FastAPI's `BackgroundTasks`

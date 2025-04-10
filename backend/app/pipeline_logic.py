@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 
 # Import helper functions and clients from utils
-from .utils import S3_CLIENT, CONFIG, get_s3_json_path, determine_if_preprocessed
+from .utils import S3_CLIENT, CONFIG, get_s3_json_path, get_s3_interactions_path, determine_if_processed
 from .models import VideoMetadata, Interaction # Import Pydantic models for structure
 
 # Placeholder imports for AI clients - replace with actual imports
@@ -36,26 +36,82 @@ def get_processing_status_from_s3(bucket: str, key: str) -> dict:
         print(f"Unexpected error reading status from s3://{bucket}/{key}: {e}")
         raise
 
+def get_interactions_from_s3(bucket: str, key: str) -> list:
+    """Reads the interactions.json file from S3 and returns the list of interactions.
+    If the file doesn't exist, returns an empty list."""
+    try:
+        response = S3_CLIENT.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        data = json.loads(content)
+        interactions = data.get('interactions', [])
+        print(f"Successfully read {len(interactions)} interactions from s3://{bucket}/{key}")
+        return interactions
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print(f"Interactions file not found: s3://{bucket}/{key} - This is normal for first query")
+            return []  # Return empty list for first interaction
+        else:
+            print(f"Error reading interactions from S3 s3://{bucket}/{key}: {e}")
+            raise
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON from s3://{bucket}/{key}: {e}")
+        raise ValueError("Invalid JSON content in interactions file")
+    except Exception as e:
+        print(f"Unexpected error reading interactions from s3://{bucket}/{key}: {e}")
+        raise
+
+def add_interaction_to_s3(bucket: str, key: str, interaction: dict):
+    """Adds a new interaction to the interactions.json file.
+    Creates the file if it doesn't exist."""
+    print(f"Adding interaction {interaction.get('interaction_id')} to s3://{bucket}/{key}")
+    retries = 3
+    
+    for attempt in range(retries):
+        try:
+            # Get existing interactions or start with empty list
+            try:
+                interactions = get_interactions_from_s3(bucket, key)
+            except:
+                interactions = []
+            
+            # Add the new interaction
+            interactions.append(interaction)
+            
+            # Write back to S3
+            data = {'interactions': interactions}
+            S3_CLIENT.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(data, indent=2),
+                ContentType='application/json'
+            )
+            print(f"Successfully added interaction {interaction.get('interaction_id')} to s3://{bucket}/{key}")
+            return  # Success, exit retry loop
+            
+        except ClientError as e:
+            print(f"S3 ClientError on attempt {attempt + 1} adding interaction to {key}: {e}")
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
+            
+        except Exception as e:
+            print(f"Error adding interaction to {key} on attempt {attempt + 1}: {e}")
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
 
 def update_interaction_status_in_s3(bucket: str, key: str, interaction_id: str, status: str, final_answer: str = None, answer_timestamp: str = None):
-    """Reads the S3 JSON, updates a specific interaction, writes it back."""
+    """Updates an existing interaction's status in the interactions.json file."""
     print(f"Attempting to update interaction {interaction_id} in s3://{bucket}/{key} to status: {status}")
     retries = 3
     for attempt in range(retries):
         try:
-            # 1. GET current JSON
-            response = S3_CLIENT.get_object(Bucket=bucket, Key=key)
-            content = response['Body'].read().decode('utf-8')
-            data = json.loads(content)
-            # Use Pydantic model for validation (optional but good)
-            # metadata = VideoMetadata(**data)
-
+            # 1. GET current interactions
+            interactions = get_interactions_from_s3(bucket, key)
+            
             # 2. Find and Update Interaction
             interaction_found = False
-            if 'interactions' not in data:
-                data['interactions'] = []
-
-            for interaction in data['interactions']:
+            for interaction in interactions:
                 if interaction.get('interaction_id') == interaction_id:
                     interaction['status'] = status
                     if final_answer is not None:
@@ -66,10 +122,11 @@ def update_interaction_status_in_s3(bucket: str, key: str, interaction_id: str, 
 
             if not interaction_found:
                 print(f"Warning: Interaction ID {interaction_id} not found in {key}. Cannot update status.")
-                # Decide if you should add it here or if it should always exist first
-                # For now, we'll just log and proceed if not found
+                # Could add logic to create it if missing, but this shouldn't happen in normal flow
+                return
 
-            # 3. PUT updated JSON back
+            # 3. PUT updated interactions back
+            data = {'interactions': interactions}
             S3_CLIENT.put_object(
                 Bucket=bucket,
                 Key=key,
@@ -80,23 +137,55 @@ def update_interaction_status_in_s3(bucket: str, key: str, interaction_id: str, 
             return # Success, exit retry loop
 
         except ClientError as e:
-            # Handle potential concurrency issues (ConditionalCheckFailedException if using versioning/ETags)
-            # Handle throttling
             print(f"S3 ClientError on attempt {attempt + 1} updating {key}: {e}")
-            if attempt == retries - 1: raise # Raise after last attempt
-            time.sleep(2 ** attempt) # Exponential backoff
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
 
         except Exception as e:
             print(f"Error updating interaction status in {key} on attempt {attempt + 1}: {e}")
-            if attempt == retries - 1: raise # Raise after last attempt
-            time.sleep(2 ** attempt) # Exponential backoff
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
 
 def update_overall_processing_status(bucket: str, key: str, overall_status: str):
-     """Reads the S3 JSON, updates the top-level processing_status, writes it back."""
-     # Similar Read-Modify-Write logic as update_interaction_status_in_s3
-     # ... (Implementation needed, handle retries) ...
-     print(f"Updating overall status for {key} to {overall_status}")
-     # TODO: Implement this function robustly
+    """Reads the S3 JSON, updates the top-level processing_status, writes it back."""
+    print(f"Updating overall status for {key} to {overall_status}")
+    retries = 3
+    
+    for attempt in range(retries):
+        try:
+            # 1. GET current JSON
+            try:
+                metadata = get_processing_status_from_s3(bucket, key)
+            except FileNotFoundError:
+                # If file doesn't exist, create a minimal one
+                metadata = {"processing_status": "PROCESSING"}
+            
+            # 2. Update status
+            metadata["processing_status"] = overall_status
+            
+            # 3. PUT updated JSON back
+            S3_CLIENT.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(metadata, indent=2),
+                ContentType='application/json'
+            )
+            print(f"Successfully updated status to {overall_status} in s3://{bucket}/{key}")
+            return  # Success, exit retry loop
+            
+        except ClientError as e:
+            print(f"S3 ClientError on attempt {attempt + 1} updating status in {key}: {e}")
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
+            
+        except Exception as e:
+            print(f"Error updating status in {key} on attempt {attempt + 1}: {e}")
+            if attempt == retries - 1: 
+                raise  # Raise after last attempt
+            time.sleep(2 ** attempt)  # Exponential backoff
 
 # --- Placeholder Functions for Pipeline Steps ---
 
@@ -201,16 +290,22 @@ def _synthesize_answer(context: str, mcp_result: str, user_query: str) -> str:
 
 # --- Background Task Implementations ---
 
-def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str, query_timestamp: str, s3_json_path: str, s3_bucket: str):
+def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str, query_timestamp: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str):
     """Background task to answer a query for a PRE-PROCESSED video."""
     print(f"BACKGROUND TASK: Starting query pipeline for interaction {interaction_id} on video {video_id}")
     start_time = time.time()
 
     try:
-        # 1. Mark as processing (ensure interaction exists first)
-        # It's better practice to add the interaction shell BEFORE starting the task,
-        # but for PoC this update confirms the task has started trying.
-        update_interaction_status_in_s3(s3_bucket, s3_json_path, interaction_id, "processing")
+        # 1. Add or update interaction with "processing" status
+        interaction = {
+            "interaction_id": interaction_id,
+            "user_query": user_query,
+            "query_timestamp": query_timestamp,
+            "status": "processing"
+        }
+        
+        # Check if interactions file exists and add the new interaction
+        add_interaction_to_s3(s3_bucket, s3_interactions_path, interaction)
 
         # 2. Load metadata (needed for context assembly)
         metadata = get_processing_status_from_s3(s3_bucket, s3_json_path)
@@ -231,7 +326,7 @@ def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str
 
         # 7. Update status to completed with the answer
         update_interaction_status_in_s3(
-            s3_bucket, s3_json_path, interaction_id, "completed",
+            s3_bucket, s3_interactions_path, interaction_id, "completed",
             final_answer=final_answer,
             answer_timestamp=datetime.now(timezone.utc).isoformat()
         )
@@ -241,7 +336,7 @@ def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str
         print(f"BACKGROUND TASK ERROR: Query pipeline for interaction {interaction_id} FAILED: {e}")
         try:
             # Attempt to mark as failed
-            update_interaction_status_in_s3(s3_bucket, s3_json_path, interaction_id, "failed")
+            update_interaction_status_in_s3(s3_bucket, s3_interactions_path, interaction_id, "failed")
         except Exception as update_e:
             print(f"BACKGROUND TASK ERROR: Failed to update status to failed for {interaction_id}: {update_e}")
     finally:
@@ -249,91 +344,99 @@ def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str
         print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} finished in {end_time - start_time:.2f} seconds.")
 
 
-def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_video_base_path: str, s3_json_path: str, s3_bucket: str, interaction_id: str, query_timestamp: str):
-    """Background task for the FULL pipeline: Download -> ... -> Answer."""
-    print(f"BACKGROUND TASK: Starting FULL pipeline for video {video_id} (interaction {interaction_id})")
+def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_video_base_path: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str, interaction_id: str, query_timestamp: str):
+    """Background task to process a NEW video and then answer a query."""
+    print(f"BACKGROUND TASK: Starting full pipeline for {video_id} with interaction {interaction_id}")
     start_time = time.time()
-    current_overall_status = "processing_download" # Initial status
 
     try:
-        # 1. Create Initial JSON & Mark initial status
+        # 1. Create initial metadata file with PROCESSING status
         initial_metadata = {
             "video_id": video_id,
             "source_url": video_url,
-            "processing_status": current_overall_status,
-            "interactions": [
-                {
-                    "interaction_id": interaction_id,
-                    "user_query": user_query,
-                    "query_timestamp": query_timestamp,
-                    "status": "pending", # Mark Q&A as pending until video is processed
-                    "ai_answer": None,
-                    "answer_timestamp": None
-                }
-            ],
-            # Initialize other fields as empty/null
-             "overall_summary": None, "key_themes": [], "total_duration_seconds": None, "chunks": []
+            "processing_status": "PROCESSING",
+            "processing_start_time": datetime.now(timezone.utc).isoformat()
         }
         S3_CLIENT.put_object(
-            Bucket=s3_bucket, Key=s3_json_path, Body=json.dumps(initial_metadata, indent=2), ContentType='application/json'
+            Bucket=s3_bucket,
+            Key=s3_json_path,
+            Body=json.dumps(initial_metadata, indent=2),
+            ContentType='application/json'
         )
-        print(f"Initial metadata saved to {s3_json_path}")
+        print(f"Created initial metadata at s3://{s3_bucket}/{s3_json_path}")
+        
+        # 2. Add initial interaction with processing status
+        interaction = {
+            "interaction_id": interaction_id,
+            "user_query": user_query,
+            "query_timestamp": query_timestamp,
+            "status": "processing"
+        }
+        add_interaction_to_s3(s3_bucket, s3_interactions_path, interaction)
 
-        # 2. Download Video
-        # TODO: Define local download path (maybe temp dir?)
-        local_video_path = f"/tmp/{video_id}.mp4" # Example path in container
-        _download_video(video_url, local_video_path)
-        s3_video_key = f"{s3_video_base_path}.mp4"
-        _upload_to_s3(local_video_path, s3_bucket, s3_video_key)
-        current_overall_status = "processing_chunking"
-        update_overall_processing_status(s3_bucket, s3_json_path, current_overall_status)
-        # TODO: Clean up local downloaded file os.remove(local_video_path)
+        # 3. Download, process, and upload the video
+        local_video_path = _download_video(video_url, f"/tmp/{video_id}.mp4")
+        _upload_to_s3(local_video_path, s3_bucket, f"{s3_video_base_path}.mp4")
 
-        # 3. Chunk Video
-        chunks_metadata_no_captions = _chunk_video(s3_video_key, s3_bucket)
-        # Update JSON with chunk info (no captions yet)
-        # ... (read, update 'chunks' field, write back) ...
-        current_overall_status = "processing_captioning"
-        update_overall_processing_status(s3_bucket, s3_json_path, current_overall_status)
+        # 4. Chunk the video into segments
+        chunks_metadata = _chunk_video(f"{s3_video_base_path}.mp4", s3_bucket)
 
-        # 4. Generate Captions & Summary
-        chunks_with_captions, summary, themes = _generate_captions_and_summary(chunks_metadata_no_captions, s3_video_base_path, s3_bucket)
-        # Update JSON with captions, summary, themes
-        # ... (read, update 'chunks', 'overall_summary', 'key_themes', write back) ...
-        current_overall_status = "processing_indexing"
-        update_overall_processing_status(s3_bucket, s3_json_path, current_overall_status)
+        # 5. Generate captions and summarize
+        chunks_with_captions, overall_summary, key_themes = _generate_captions_and_summary(
+            chunks_metadata, s3_video_base_path, s3_bucket
+        )
 
-        # 5. Index Captions
+        # 6. Index captions to Pinecone
         _index_captions(video_id, chunks_with_captions)
-        current_overall_status = "completed" # Video processing done!
-        update_overall_processing_status(s3_bucket, s3_json_path, current_overall_status)
-        # TODO: Clean up temporary S3 chunks if desired
 
-        # 6. Now, process the initial query using the generated data
-        print(f"Video processing complete for {video_id}. Now running query part for interaction {interaction_id}")
-        update_interaction_status_in_s3(s3_bucket, s3_json_path, interaction_id, "processing") # Mark Q&A as processing
+        # 7. Update the metadata file with all information
+        updated_metadata = {
+            "video_id": video_id,
+            "source_url": video_url,
+            "processing_status": "FINISHED",
+            "processing_complete_time": datetime.now(timezone.utc).isoformat(),
+            "overall_summary": overall_summary,
+            "key_themes": key_themes,
+            "chunks": chunks_with_captions,
+        }
+        S3_CLIENT.put_object(
+            Bucket=s3_bucket,
+            Key=s3_json_path,
+            Body=json.dumps(updated_metadata, indent=2),
+            ContentType='application/json'
+        )
+        print(f"Updated metadata with status FINISHED at s3://{s3_bucket}/{s3_json_path}")
 
+        # 8. Handle the query (same as run_query_pipeline_async)
+        # Retrieve relevant chunks
         retrieved_chunks = _retrieve_relevant_chunks(video_id, user_query)
-        context = _assemble_context(retrieved_chunks, summary, themes)
+        
+        # Assemble context
+        context = _assemble_context(retrieved_chunks, overall_summary, key_themes)
+        
+        # Call MCP
         mcp_result = _call_mcp(context, user_query)
+        
+        # Synthesize answer
         final_answer = _synthesize_answer(context, mcp_result, user_query)
-
+        
+        # Update interaction status
         update_interaction_status_in_s3(
-            s3_bucket, s3_json_path, interaction_id, "completed",
+            s3_bucket, s3_interactions_path, interaction_id, "completed",
             final_answer=final_answer,
             answer_timestamp=datetime.now(timezone.utc).isoformat()
         )
-        print(f"BACKGROUND TASK: Full pipeline for interaction {interaction_id} COMPLETED.")
+        print(f"BACKGROUND TASK: Full pipeline for {video_id} with interaction {interaction_id} COMPLETED.")
 
     except Exception as e:
-        print(f"BACKGROUND TASK ERROR: Full pipeline for video {video_id} / interaction {interaction_id} FAILED at step '{current_overall_status}': {e}")
+        print(f"BACKGROUND TASK ERROR: Full pipeline for {video_id} with interaction {interaction_id} FAILED: {e}")
         try:
-            # Attempt to mark overall video and specific interaction as failed
-            update_overall_processing_status(s3_bucket, s3_json_path, "failed")
-            update_interaction_status_in_s3(s3_bucket, s3_json_path, interaction_id, "failed")
+            # Mark as failed in both files
+            update_overall_processing_status(s3_bucket, s3_json_path, "FAILED")
+            update_interaction_status_in_s3(s3_bucket, s3_interactions_path, interaction_id, "failed")
         except Exception as update_e:
-            print(f"BACKGROUND TASK ERROR: Failed to update status to failed for {interaction_id} after error: {update_e}")
+            print(f"BACKGROUND TASK ERROR: Failed to update status to failed: {update_e}")
     finally:
         end_time = time.time()
-        print(f"BACKGROUND TASK: Full pipeline for interaction {interaction_id} finished in {end_time - start_time:.2f} seconds.")
+        print(f"BACKGROUND TASK: Full pipeline for {video_id} finished in {end_time - start_time:.2f} seconds.")
 

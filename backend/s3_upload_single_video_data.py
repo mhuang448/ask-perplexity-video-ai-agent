@@ -61,7 +61,7 @@ def _upload_single_file(s3_client, local_path, bucket_name, s3_key, content_type
         return False, s3_key
 
 
-def upload_single_video_concurrent(single_video_dir_path, bucket_name, s3_target_prefix="processed-videos/"):
+def upload_single_video_concurrent(single_video_dir_path, bucket_name, s3_target_prefix="video-data/"):
     """
     Scans a single video directory and uploads its contents (.mp4, .json, chunks/*)
     concurrently to S3 using a ThreadPoolExecutor.
@@ -215,18 +215,18 @@ def upload_single_video_concurrent(single_video_dir_path, bucket_name, s3_target
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python dist_s3_upload_single_video_data.py <path_to_single_video_dir>")
-        print("Example: python dist_s3_upload_single_video_data.py ./processed-videos/your_video_id")
+        print("Example: python dist_s3_upload_single_video_data.py ./video-data/your_video_id")
         print("Environment variables required:")
         print("  - S3_BUCKET_NAME: Target S3 bucket")
         print("  - AWS_REGION: AWS region for the bucket")
         print("Optional environment variables:")
         print(f"  - MAX_UPLOAD_WORKERS: Max concurrent uploads (default: {DEFAULT_MAX_WORKERS})")
-        print("  - S3_TARGET_PREFIX: S3 prefix before video ID (default: processed-videos/)")
+        print("  - S3_TARGET_PREFIX: S3 prefix before video ID (default: video-data/)")
         sys.exit(1)
 
     single_video_dir = sys.argv[1]
     bucket = os.getenv("S3_BUCKET_NAME")
-    s3_prefix = os.getenv("S3_TARGET_PREFIX", "processed-videos/") # Allow overriding prefix
+    s3_prefix = os.getenv("S3_TARGET_PREFIX", "video-data/") # Allow overriding prefix
 
     if not bucket:
          print("Error: S3_BUCKET_NAME environment variable not set.")

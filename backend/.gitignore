@@ -1,10 +1,12 @@
-.env
+.env*
 
 processed-videos/
 
-processed-videos/
+video-data/
 
 venv/
 
 __pycache__/
 *.pyc
+
+mcp_config.json

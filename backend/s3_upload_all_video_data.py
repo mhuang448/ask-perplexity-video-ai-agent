@@ -60,7 +60,7 @@ def _upload_single_file(s3_client, local_path, bucket_name, s3_key, content_type
         return False, s3_key
 
 
-def upload_all_processed_concurrent(local_base_dir, bucket_name, s3_target_prefix="processed-videos/"):
+def upload_all_processed_concurrent(local_base_dir, bucket_name, s3_target_prefix="video-data/"):
     """
     Iterates through subdirectories in local_base_dir, identifies all files to upload,
     and uploads them concurrently to S3 using a ThreadPoolExecutor.
@@ -230,13 +230,13 @@ def upload_all_processed_concurrent(local_base_dir, bucket_name, s3_target_prefi
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python dist_s3_upload_all_video_data.py <path_to_local_PROCESSED_VIDEOS_base_dir>")
-        print("Example: python dist_s3_upload_all_video_data.py ./processed-videos")
+        print("Example: python dist_s3_upload_all_video_data.py ./video-data")
         print(f"Configure concurrency with MAX_UPLOAD_WORKERS environment variable (default: {DEFAULT_MAX_WORKERS}).")
         sys.exit(1)
 
     local_dir = sys.argv[1]
     bucket = os.getenv("S3_BUCKET_NAME")
-    s3_prefix = os.getenv("S3_TARGET_PREFIX", "processed-videos/") # Allow overriding prefix via env var
+    s3_prefix = os.getenv("S3_TARGET_PREFIX", "video-data/") # Allow overriding prefix via env var
 
     if not bucket:
          print("Error: S3_BUCKET_NAME environment variable not set.")

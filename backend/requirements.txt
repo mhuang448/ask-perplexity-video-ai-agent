@@ -15,3 +15,5 @@ opencv-python
 google-genai
 pinecone[grpc]
 openai
+
+re

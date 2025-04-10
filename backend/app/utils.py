@@ -1,5 +1,6 @@
 # app/utils.py
 import os
+import re
 import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from dotenv import load_dotenv
@@ -65,38 +66,44 @@ S3_CLIENT = get_s3_client() # Initialize client once
 
 # --- Helper Functions ---
 
-def generate_unique_video_id(url: str) -> str:
-    """Generates a somewhat unique ID based on the URL (improve as needed)."""
-    # Simple approach for PoC - consider hashing for better uniqueness
-    base_id = str(uuid.uuid4()) # Start with a random UUID
-    # You could try extracting parts of the URL if they are reliably unique
-    # url_parts = url.split('/')
-    # if len(url_parts) > 4:
-    #    base_id = f"{url_parts[3]}_{url_parts[5]}"
-    print(f"Generated video ID: {base_id} for URL: {url}")
-    return base_id
+def generate_unique_video_name(url: str) -> str:
+    """Generates a unique name based on the URL (improve as needed). 
+    To be used as primary ID of video in videos/ directory in S3."""
+    # # Simple approach for PoC - consider hashing for better uniqueness
+    # base_id = str(uuid.uuid4()) # Start with a random UUID
+    # print(f"Generated video ID: {base_id} for URL: {url}")
+    match = re.search(r"@(?P<username>[^/]+)/video/(?P<video_id>\d+)", url)
+    if not match:
+        print(f"Error: Could not extract username and video ID from URL: {url}")
+        return
 
-PREPROCESSED_PREFIX = "preprocessed/"
-PROCESSED_PREFIX = "processed/"
+    username = match.group("username")
+    video_id = match.group("video_id")
 
-def get_s3_json_path(video_id: str, is_preprocessed: bool) -> str:
+    # Construct the name: username-videoid
+    video_name = f"{username}-{video_id}"
+    return video_name
+
+VIDEO_DATA_PREFIX = "video-data/"
+
+def get_s3_json_path(video_name: str) -> str:
     """Constructs the S3 key (path) for the video's JSON metadata file."""
-    prefix = PREPROCESSED_PREFIX if is_preprocessed else PROCESSED_PREFIX
-    return f"{prefix}{video_id}/{video_id}.json"
+    return f"{VIDEO_DATA_PREFIX}{video_name}/{video_name}.json"
 
-def get_s3_video_base_path(video_id: str, is_preprocessed: bool) -> str:
+def get_s3_interactions_path(video_name: str) -> str:
+    """Constructs the S3 key (path) for the video's interactions.json file.
+    This file is separate from the main metadata to reduce concurrency issues."""
+    return f"{VIDEO_DATA_PREFIX}{video_name}/interactions.json"
+
+def get_s3_video_base_path(video_name: str) -> str:
     """Constructs the base S3 key (path) for video/chunk files."""
-    prefix = PREPROCESSED_PREFIX if is_preprocessed else PROCESSED_PREFIX
-    return f"{prefix}{video_id}/{video_id}" # e.g., processed/vid123/vid123 -> .mp4 or /chunks/
+    return f"{VIDEO_DATA_PREFIX}{video_name}/{video_name}" # e.g., video-data/<USER_NAME>-<VIDEO_ID>/<USER_NAME>-<VIDEO_ID> -> .mp4 or /chunks/
 
-def determine_if_preprocessed(video_id: str) -> bool:
-    """Placeholder logic to guess if a video ID is preprocessed."""
-    # TODO: Implement real logic. Maybe check if the JSON exists under PREPROCESSED_PREFIX first?
-    # Or rely on a naming convention for generated IDs vs preprocessed IDs.
-    print(f"Warning: Using placeholder logic for determine_if_preprocessed for {video_id}")
-    # Simplistic guess: If it looks like a UUID, maybe it's newly generated?
-    try:
-        uuid.UUID(video_id)
-        return False # Looks like a UUID, assume newly processed
-    except ValueError:
-        return True # Doesn't look like a UUID, assume preprocessed
+def determine_if_processed(video_name: str) -> bool:
+    """Placeholder function to determine if a video is processed.
+    In a real implementation, this might check for the existence of the file
+    or review flags in a database.
+    """
+    # For PoC, we assume this is a newly processed video (not processed)
+    # You could implement actual logic here if needed
+    return False
