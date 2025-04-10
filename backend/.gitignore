@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 
 mcp_config.json
+
+intermediate_prompt.txt
