@@ -39,7 +39,8 @@ def load_config() -> Dict[str, Any]: # Changed return type hint
         "openai_synthesis_model": os.getenv("OPENAI_SYNTHESIS_MODEL", "gpt-4o-mini"), # Added for synthesis
         "google_api_key": os.getenv("GOOGLE_API_KEY"), # Or handle GOOGLE_APPLICATION_CREDENTIALS
         "perplexity_api_key": os.getenv("PERPLEXITY_API_KEY"), # Needed for MCP server env
-        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"), # Needed for potential Claude tool selection
+        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"), # Needed for Claude tool selection
+        "anthropic_tool_selection_model": os.getenv("ANTHROPIC_TOOL_SELECTION_MODEL", "claude-3-7-sonnet-20250219"), # Added for Anthropic
         # Add direct AWS keys only if absolutely needed (prefer IAM roles)
         "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
         "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),

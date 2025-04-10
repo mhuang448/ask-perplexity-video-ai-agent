@@ -502,7 +502,7 @@ async def _select_and_run_tool_llm_based(
         messages = [{"role": "user", "content": query_context}]
         print("  Sending query and tools to Anthropic for selection...")
         claude_response = anthropic_client.messages.create(
-            model="claude-3-7-sonnet-20250219", # Use the specified model
+            model=CONFIG["anthropic_tool_selection_model"], # Use the specified model
             max_tokens=1000,
             messages=messages,
             tools=available_tools,
