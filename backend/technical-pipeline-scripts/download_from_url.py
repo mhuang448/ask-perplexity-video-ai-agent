@@ -12,17 +12,18 @@ def download_tiktok_video(url, base_download_path):
         return
 
     username = match.group("username")
-    video_id = match.group("video_id")
+    tiktok_video_id = match.group("video_id")
+    video_id = f"{username}-{tiktok_video_id}"
 
     # Construct the specific download directory path: ./videos/username-videoid
-    download_subdir = f"{username}-{video_id}"
+    download_subdir = f"{username}-{tiktok_video_id}"
     specific_download_path = os.path.join(base_download_path, download_subdir)
 
     # Create the specific subdirectory if it doesn't exist
     os.makedirs(specific_download_path, exist_ok=True)
 
     # Define the output filename template: username-videoid.mp4
-    output_filename = f"{username}-{video_id}.%(ext)s"
+    output_filename = f"{username}-{tiktok_video_id}.%(ext)s"
     output_template = os.path.join(specific_download_path, output_filename)
 
     # Options for yt-dlp:
@@ -39,17 +40,16 @@ def download_tiktok_video(url, base_download_path):
         try:
             ydl.download([url])
             # Construct the expected final path for the success message
-            final_file_path = os.path.join(specific_download_path, f"{username}-{video_id}.mp4")
+            final_file_path = os.path.join(specific_download_path, f"{video_id}.mp4")
             # Check if the file actually exists after download before confirming
             if os.path.exists(final_file_path):
                  print(f"Download successful: {final_file_path}")
 
                  # Create the JSON file
-                 video_filename = f"{username}-{video_id}.mp4"
-                 json_filename = f"{username}-{video_id}.json"
+                 json_filename = f"{video_id}.json"
                  json_filepath = os.path.join(specific_download_path, json_filename)
                  json_data = {
-                     "video_name": video_filename,
+                     "video_id": video_id,
                      "processing_status": "PROCESSING"
                  }
 

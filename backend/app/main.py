@@ -15,11 +15,11 @@ from .models import (
 )
 from .utils import (
     CONFIG, determine_if_processed, get_s3_json_path, get_s3_interactions_path,
-    generate_unique_video_name, get_s3_video_base_path
+    generate_unique_video_id, get_s3_video_base_path
 )
 from .pipeline_logic import (
     run_query_pipeline_async, run_full_pipeline_async,
-    get_processing_status_from_s3, get_interactions_from_s3,
+    get_video_metadata_from_s3, get_interactions_from_s3,
     # Assume this helper exists to list preprocessed video IDs
     # get_list_of_preprocessed_video_ids
 )
@@ -136,9 +136,9 @@ async def get_for_you_videos():
 
 
 @app.post("/api/query/async", response_model=ProcessingStartedResponse, status_code=202, tags=["Query"])
-async def query_preprocessed_video(query: QueryRequest, background_tasks: BackgroundTasks):
-    """Triggers async query processing for a PRE-PROCESSED video."""
-    print(f"Received query for preprocessed video {query.video_id}: {query.user_query}")
+async def query_processed_video(query: QueryRequest, background_tasks: BackgroundTasks):
+    """Triggers async query processing for a processed video."""
+    print(f"Received query for processed video {query.video_id}: {query.user_query}")
 
     interaction_id = str(uuid.uuid4())
     query_timestamp = datetime.now(timezone.utc).isoformat()
@@ -177,7 +177,7 @@ async def process_new_video_and_query(process_req: ProcessRequest, background_ta
     """Triggers async FULL pipeline (download to answer) for a NEW video URL."""
     print(f"Received request for new video {process_req.video_url} with query: {process_req.user_query}")
 
-    video_id = generate_unique_video_name(process_req.video_url)
+    video_id = generate_unique_video_id(process_req.video_url)
     interaction_id = str(uuid.uuid4())
     query_timestamp = datetime.now(timezone.utc).isoformat()
 

@@ -3,10 +3,18 @@ import time
 import json
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
+from typing import List, Dict, Any, Tuple, Optional # Added List, Dict, Any, Tuple, Optional
 
 # Import helper functions and clients from utils
-from .utils import S3_CLIENT, CONFIG, get_s3_json_path, get_s3_interactions_path, determine_if_processed
+from .utils import (
+    S3_CLIENT, CONFIG, get_s3_json_path, get_s3_interactions_path,
+    OPENAI_CLIENT, PINECONE_INDEX # Added OpenAI and Pinecone clients
+)
 from .models import VideoMetadata, Interaction # Import Pydantic models for structure
+
+# Import specific exceptions for better handling
+from openai import OpenAIError
+from pinecone.exceptions import PineconeException
 
 # Placeholder imports for AI clients - replace with actual imports
 # import pinecone
@@ -14,13 +22,13 @@ from .models import VideoMetadata, Interaction # Import Pydantic models for stru
 
 # --- S3 JSON Read/Write Helpers (Crucial for State) ---
 
-def get_processing_status_from_s3(bucket: str, key: str) -> dict:
+def get_video_metadata_from_s3(bucket: str, key: str) -> dict:
     """Reads the JSON metadata file from S3 and returns it as a dict."""
     try:
         response = S3_CLIENT.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
         data = json.loads(content)
-        print(f"Successfully read status from s3://{bucket}/{key}")
+        print(f"Successfully read metadata from s3://{bucket}/{key}")
         return data
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
@@ -33,7 +41,7 @@ def get_processing_status_from_s3(bucket: str, key: str) -> dict:
         print(f"Error decoding JSON from s3://{bucket}/{key}: {e}")
         raise ValueError("Invalid JSON content in S3 file")
     except Exception as e:
-        print(f"Unexpected error reading status from s3://{bucket}/{key}: {e}")
+        print(f"Unexpected error reading metadata from s3://{bucket}/{key}: {e}")
         raise
 
 def get_interactions_from_s3(bucket: str, key: str) -> list:
@@ -157,7 +165,7 @@ def update_overall_processing_status(bucket: str, key: str, overall_status: str)
         try:
             # 1. GET current JSON
             try:
-                metadata = get_processing_status_from_s3(bucket, key)
+                metadata = get_video_metadata_from_s3(bucket, key)
             except FileNotFoundError:
                 # If file doesn't exist, create a minimal one
                 metadata = {"processing_status": "PROCESSING"}
@@ -193,6 +201,7 @@ def _download_video(video_url: str, local_path: str):
     print(f"Placeholder: Downloading {video_url} to {local_path}...")
     time.sleep(2) # Simulate download time
     # TODO: Implement actual download using yt-dlp or requests
+    # see code in backend/technical-pipeline-scripts/download_from_url.py
     print("Placeholder: Download complete.")
     # Return path to downloaded file
     return local_path
@@ -200,6 +209,7 @@ def _download_video(video_url: str, local_path: str):
 def _upload_to_s3(local_path: str, bucket: str, s3_key: str):
     print(f"Placeholder: Uploading {local_path} to s3://{bucket}/{s3_key}...")
     # TODO: Implement S3 upload using S3_CLIENT.upload_file
+    # see code in backend/upload_single_video_data.py
     time.sleep(1)
     print("Placeholder: Upload complete.")
 
@@ -207,6 +217,7 @@ def _chunk_video(video_s3_key: str, bucket: str) -> list:
     print(f"Placeholder: Chunking video s3://{bucket}/{video_s3_key}...")
     time.sleep(5) # Simulate chunking time
     # TODO: Implement chunking
+    # see code in backend/technical-pipeline-scripts/chunk_by_scenes.py
     #   - Download video from S3 (or stream)
     #   - Use PySceneDetect or ffmpeg
     #   - Upload chunks to S3 (e.g., under /chunks/ prefix)
@@ -222,6 +233,7 @@ def _generate_captions_and_summary(chunks_metadata: list, video_s3_base_path: st
      print("Placeholder: Generating captions and summary...")
      time.sleep(10) # Simulate AI calls
      # TODO: Implement caption/summary generation
+     # see code in backend/technical-pipeline-scripts/caption_chunks_and_summarize.py
      #   - For each chunk:
      #     - Download chunk from S3 (or use presigned URL)
      #     - Call Gemini API to generate caption
@@ -238,6 +250,7 @@ def _index_captions(video_id: str, chunks_with_captions: list):
     print(f"Placeholder: Indexing captions for {video_id}...")
     time.sleep(3) # Simulate embedding/indexing
     # TODO: Implement indexing
+    # see code in backend/technical-pipeline-scripts/index_and_retrieve.py
     #   - Initialize Pinecone client
     #   - For each chunk with a caption:
     #     - Get caption text
@@ -246,25 +259,149 @@ def _index_captions(video_id: str, chunks_with_captions: list):
     #     - Upsert vectors to Pinecone in batches
     print("Placeholder: Indexing complete.")
 
-def _retrieve_relevant_chunks(video_id: str, user_query: str) -> list:
-    print(f"Placeholder: Retrieving relevant chunks for query: '{user_query}'...")
-    time.sleep(1) # Simulate embedding query + Pinecone search
-    # TODO: Implement retrieval
-    #   - Initialize Pinecone client
-    #   - Get embedding for user_query (OpenAI)
-    #   - Query Pinecone index, filtering by video_id metadata field
-    #   - Return top_k matching results (including metadata)
-    print("Placeholder: Retrieval complete.")
-    # Return list of retrieved chunk metadata dictionaries from Pinecone results
-    return [{"caption": "Placeholder retrieved caption 1", "start_timestamp": "00:01.000", "metadata_3": "metadata_3_content"}] # Example
 
-def _assemble_context(retrieved_chunks: list, summary: str, themes: list) -> str:
-    print("Placeholder: Assembling context...")
-    # TODO: Implement context assembly based on README description
-    context = f"Summary: {summary}\\nThemes: {', '.join(themes)}\\n\\nRelevant Clips:\\n"
-    # Add details from retrieved_chunks
-    print("Placeholder: Context assembly complete.")
-    return context # Return formatted context string
+# --- Retrieval and Context Assembly ---  (Integrated from index_and_retrieve.py)
+
+def _retrieve_relevant_chunks(video_id: str, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """Embeds the user query and retrieves relevant chunks from Pinecone,
+       filtering by video_id.
+    """
+    print(f"Retrieving relevant chunks for video '{video_id}', query: '{user_query}'")
+    if not OPENAI_CLIENT:
+        print("ERROR: OpenAI client not initialized. Cannot embed query.")
+        raise RuntimeError("OpenAI client not available")
+    if not PINECONE_INDEX:
+        print("ERROR: Pinecone index not initialized. Cannot query index.")
+        raise RuntimeError("Pinecone index not available")
+
+    embed_model = CONFIG["openai_embedding_model"]
+    
+    # 1. Embed the query
+    try:
+        start_embed = time.time()
+        response = OPENAI_CLIENT.embeddings.create(
+            input=[user_query],
+            model=embed_model
+        )
+        query_vector = response.data[0].embedding
+        end_embed = time.time()
+        print(f"  Query embedding took: {end_embed - start_embed:.4f} seconds")
+    except OpenAIError as e:
+        print(f"  ERROR embedding query: {e}")
+        raise RuntimeError("Failed to embed query") from e
+    except Exception as e:
+        print(f"  Unexpected ERROR during query embedding: {e}")
+        raise
+
+    # 2. Query Pinecone with video_id filter
+    try:
+        start_query = time.time()
+        filter_params = {"video_id": f"{video_id}"} # Pinecone expects metadata key directly
+        print(f"  Filter params: {filter_params}")
+        # Note: Pinecone metadata structure in index_and_retrieve.py used video_name. 
+        # Note: the video_id for our backend is <USERNAME>-<VIDEO_ID> and the video_name is structured as <USERNAME>-<VIDEO_ID>.mp4 for Pinecone
+        
+        query_results = PINECONE_INDEX.query(
+            vector=query_vector,
+            top_k=top_k,
+            include_metadata=True,
+            filter=filter_params 
+        )
+        end_query = time.time()
+        print(f"  Pinecone query took: {end_query - start_query:.4f} seconds")
+
+        retrieved_chunks = query_results.get('matches', [])
+        print(f"  Retrieved {len(retrieved_chunks)} chunks for video '{video_id}'")
+        
+        # Sort by chunk_number if present
+        if retrieved_chunks:
+            retrieved_chunks.sort(key=lambda x: x.get('metadata', {}).get('chunk_number', float('inf')))
+            print("  Sorted retrieved chunks by chunk_number.")
+
+        return retrieved_chunks
+
+    except PineconeException as e:
+        print(f"  ERROR during Pinecone query: {e}")
+        # Return empty list on Pinecone error to allow attempting context assembly
+        return [] 
+    except Exception as e:
+        print(f"  Unexpected ERROR during Pinecone query: {e}")
+        # Return empty list on general error
+        return []
+
+def _assemble_context(retrieved_chunks: List[Dict[str, Any]], video_metadata: Dict[str, Any]) -> str:
+    """Assembles the context string from retrieved chunks and video metadata."""
+    print("Assembling context...")
+    
+    # Extract details from the main video metadata
+    video_summary = video_metadata.get("overall_summary", "No summary available.")
+    video_id = video_metadata.get("video_id", "")
+    # Extract TikTok user_name from video_id
+    user_name = video_id.split('-')[0] if '-' in video_id else None
+    key_themes = video_metadata.get("key_themes", "")
+    total_duration = video_metadata.get("total_duration_seconds")
+    num_chunks = video_metadata.get("num_chunks") # Might be None if not added during chunking
+    num_chunks_suffix = f'/{num_chunks}' if isinstance(num_chunks, int) else ""
+
+    context_parts = []
+    context_parts.append("Video Summary:")
+    context_parts.append(video_summary)
+
+    # Add user_name to context
+    if user_name:
+        context_parts.append(f"\nUsername of TikTok account that posted this video:\n{user_name}")
+    
+    if key_themes:
+        context_parts.append("\nKey Themes:")
+        context_parts.append(key_themes)
+
+    if total_duration:
+        context_parts.append(f"\nTotal Video Duration: {total_duration:.2f} seconds")
+
+    context_parts.append("\nPotentially Relevant Video Clips (in order):")
+    context_parts.append("---")
+
+    if not retrieved_chunks:
+        context_parts.append("(No specific video clips retrieved based on query)")
+    else:
+        for i, chunk_match in enumerate(retrieved_chunks):
+            metadata = chunk_match.get('metadata', {})
+            seq_num = metadata.get('chunk_number', '?')
+            if isinstance(seq_num, (int, float)):
+                seq_num = int(seq_num)
+            start_ts = metadata.get('start_timestamp', '?') # Handle missing keys gracefully
+            end_ts = metadata.get('end_timestamp', '?')
+            caption = metadata.get('caption', '(Caption text missing)')
+
+            # Calculate relative time hints
+            norm_start = metadata.get('normalized_start_time')
+            norm_end = metadata.get('normalized_end_time')
+            time_hint = ""
+            hints = []
+            is_valid_start = isinstance(norm_start, (float, int))
+            is_valid_end = isinstance(norm_end, (float, int))
+
+            if is_valid_start and is_valid_end:
+                if norm_start <= 0.15:
+                    hints.append("near the beginning")
+                if norm_end >= 0.85:
+                    hints.append("near the end")
+                if not hints and norm_start > 0.15 and norm_end < 0.85:
+                    hints.append("around the middle")
+            
+            if hints:
+                time_hint = f" ({' and '.join(hints)})"
+            
+            context_parts.append(f"Video Clip {seq_num}{num_chunks_suffix} (Time: {start_ts} - {end_ts}){time_hint}:")
+            context_parts.append(caption)
+            if i < len(retrieved_chunks) - 1:
+                context_parts.append("---")
+
+    final_context = "\n".join(context_parts)
+    print(f"Context assembly complete. Final context length: {len(final_context)}")
+    return final_context
+
+# --- Placeholder Functions for Downstream Steps ---
 
 def _call_mcp(context: str, user_query: str):
     print("Placeholder: Calling Perplexity MCP...")
@@ -288,49 +425,52 @@ def _synthesize_answer(context: str, mcp_result: str, user_query: str) -> str:
     return final_answer
 
 
-# --- Background Task Implementations ---
+# --- Background Task Implementations --- (Updated to use integrated functions)
 
 def run_query_pipeline_async(video_id: str, user_query: str, interaction_id: str, query_timestamp: str, s3_json_path: str, s3_interactions_path: str, s3_bucket: str):
-    """Background task to answer a query for a PRE-PROCESSED video."""
+    """Background task to answer a query for a PROCESSED video."""
     print(f"BACKGROUND TASK: Starting query pipeline for interaction {interaction_id} on video {video_id}")
     start_time = time.time()
 
     try:
-        # 1. Add or update interaction with "processing" status
+        # 1. Add interaction with "processing" status
         interaction = {
             "interaction_id": interaction_id,
             "user_query": user_query,
             "query_timestamp": query_timestamp,
             "status": "processing"
         }
-        
-        # Check if interactions file exists and add the new interaction
         add_interaction_to_s3(s3_bucket, s3_interactions_path, interaction)
 
-        # 2. Load metadata (needed for context assembly)
-        metadata = get_processing_status_from_s3(s3_bucket, s3_json_path)
-        summary = metadata.get("overall_summary", "Summary not found.")
-        themes = metadata.get("key_themes", [])
+        # 2. Load full video metadata (needed for context assembly)
+        # Note: get_processing_status_from_s3 reads the *full* metadata file
+        video_metadata = get_video_metadata_from_s3(s3_bucket, s3_json_path)
+        print(f"===============\nVIDEO METADATA:\n{video_metadata}\n================")
+        # summary = video_metadata.get("overall_summary", "Summary not found.") # Extracted within _assemble_context
+        # themes = video_metadata.get("key_themes", []) # Extracted within _assemble_context
 
         # 3. Retrieve relevant chunks from Pinecone
+        # Use video_id (which should match the one used during indexing)
         retrieved_chunks = _retrieve_relevant_chunks(video_id, user_query)
+        print(f"===============\nRETRIEVED CHUNKS:\n{retrieved_chunks}\n================")
 
-        # 4. Assemble context
-        context = _assemble_context(retrieved_chunks, summary, themes)
-
+        # 4. Assemble context using retrieved chunks and full metadata
+        context = _assemble_context(retrieved_chunks, video_metadata)
+        print(f"===============\nCONTEXT:\n{context}\n================")
         # 5. Call MCP tool
         mcp_result = _call_mcp(context, user_query)
-
+        print(f"===============\nMCP RESULT:\n{mcp_result}\n================")
         # 6. Synthesize final answer
         final_answer = _synthesize_answer(context, mcp_result, user_query)
-
+        print(f"===============\nFINAL ANSWER:\n{final_answer}\n================")
+        
         # 7. Update status to completed with the answer
-        update_interaction_status_in_s3(
-            s3_bucket, s3_interactions_path, interaction_id, "completed",
-            final_answer=final_answer,
-            answer_timestamp=datetime.now(timezone.utc).isoformat()
-        )
-        print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} COMPLETED.")
+        # update_interaction_status_in_s3(
+        #     s3_bucket, s3_interactions_path, interaction_id, "completed",
+        #     final_answer=final_answer,
+        #     answer_timestamp=datetime.now(timezone.utc).isoformat()
+        # )
+        # print(f"BACKGROUND TASK: Query pipeline for interaction {interaction_id} COMPLETED.")
 
     except Exception as e:
         print(f"BACKGROUND TASK ERROR: Query pipeline for interaction {interaction_id} FAILED: {e}")
@@ -348,6 +488,7 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
     """Background task to process a NEW video and then answer a query."""
     print(f"BACKGROUND TASK: Starting full pipeline for {video_id} with interaction {interaction_id}")
     start_time = time.time()
+    full_video_metadata = None # Initialize variable to store the complete metadata
 
     try:
         # 1. Create initial metadata file with PROCESSING status
@@ -374,45 +515,42 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
         }
         add_interaction_to_s3(s3_bucket, s3_interactions_path, interaction)
 
-        # 3. Download, process, and upload the video
-        local_video_path = _download_video(video_url, f"/tmp/{video_id}.mp4")
+        # --- Video Processing Steps ---
+        local_video_path = _download_video(video_url, f"/tmp/{video_id}.mp4") # TODO: Handle /tmp path robustly
         _upload_to_s3(local_video_path, s3_bucket, f"{s3_video_base_path}.mp4")
-
-        # 4. Chunk the video into segments
         chunks_metadata = _chunk_video(f"{s3_video_base_path}.mp4", s3_bucket)
-
-        # 5. Generate captions and summarize
         chunks_with_captions, overall_summary, key_themes = _generate_captions_and_summary(
             chunks_metadata, s3_video_base_path, s3_bucket
         )
-
-        # 6. Index captions to Pinecone
         _index_captions(video_id, chunks_with_captions)
 
-        # 7. Update the metadata file with all information
-        updated_metadata = {
+        # --- Finalize Metadata ---
+        # This is the complete metadata after processing
+        full_video_metadata = {
             "video_id": video_id,
             "source_url": video_url,
-            "processing_status": "FINISHED",
+            "processing_status": "FINISHED", # Mark as finished *before* query handling
             "processing_complete_time": datetime.now(timezone.utc).isoformat(),
             "overall_summary": overall_summary,
             "key_themes": key_themes,
             "chunks": chunks_with_captions,
+            # TODO: Consider adding total_duration and num_chunks here if available from chunking step
         }
         S3_CLIENT.put_object(
             Bucket=s3_bucket,
             Key=s3_json_path,
-            Body=json.dumps(updated_metadata, indent=2),
+            Body=json.dumps(full_video_metadata, indent=2),
             ContentType='application/json'
         )
         print(f"Updated metadata with status FINISHED at s3://{s3_bucket}/{s3_json_path}")
 
-        # 8. Handle the query (same as run_query_pipeline_async)
-        # Retrieve relevant chunks
+        # --- Handle the Query --- (Now uses the integrated functions)
+        
+        # Retrieve relevant chunks using the completed video_id and user query
         retrieved_chunks = _retrieve_relevant_chunks(video_id, user_query)
         
-        # Assemble context
-        context = _assemble_context(retrieved_chunks, overall_summary, key_themes)
+        # Assemble context using retrieved chunks and the *full* metadata we just saved
+        context = _assemble_context(retrieved_chunks, full_video_metadata)
         
         # Call MCP
         mcp_result = _call_mcp(context, user_query)
@@ -420,7 +558,7 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
         # Synthesize answer
         final_answer = _synthesize_answer(context, mcp_result, user_query)
         
-        # Update interaction status
+        # Update interaction status to completed
         update_interaction_status_in_s3(
             s3_bucket, s3_interactions_path, interaction_id, "completed",
             final_answer=final_answer,
@@ -431,8 +569,12 @@ def run_full_pipeline_async(video_url: str, user_query: str, video_id: str, s3_v
     except Exception as e:
         print(f"BACKGROUND TASK ERROR: Full pipeline for {video_id} with interaction {interaction_id} FAILED: {e}")
         try:
-            # Mark as failed in both files
-            update_overall_processing_status(s3_bucket, s3_json_path, "FAILED")
+            # Mark as failed in both files if possible
+            if full_video_metadata: # Check if metadata was created before failing
+                update_overall_processing_status(s3_bucket, s3_json_path, "FAILED")
+            else:
+                print("Skipping overall status update to FAILED as initial metadata might not exist.")
+            # Always try to update interaction status
             update_interaction_status_in_s3(s3_bucket, s3_interactions_path, interaction_id, "failed")
         except Exception as update_e:
             print(f"BACKGROUND TASK ERROR: Failed to update status to failed: {update_e}")

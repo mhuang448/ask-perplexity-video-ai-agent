@@ -44,27 +44,27 @@ Here's a more detailed breakdown of the implemented technical steps that support
 1.  **Video Discovery & Acquisition:**
 
     - **(Discovery - Optional):** The `scrape_tiktok_url.py` script demonstrates a method for discovering relevant video URLs, acting as a potential input source for the system. It uses the `TikTokApi` library (requiring an `ms_token` from browser cookies for authentication) to search for trending videos. It applies filters based on criteria like maximum duration and minimum view count. It includes retry logic and can return a randomly selected matching URL or fall back to the shortest video found.
-    - **(Acquisition):** Once a URL is obtained, the `download_from_url.py` script uses the `yt-dlp` library to download the video. It extracts identifiers (like username and video ID) from the URL to create a dedicated directory (e.g., `videos/username-videoid/`) and saves the downloaded video file (e.g., `username-videoid.mp4`) within it. It also creates an initial JSON metadata file with a `processing_status` field set to "PROCESSING" to track the video's progression through the pipeline stages.
+    - **(Acquisition):** Once a URL is obtained, the `download_from_url.py` script uses the `yt-dlp` library to download the video. It extracts identifiers (like TikTok username and TikTok Video ID) from the URL to create a dedicated directory (e.g., `videos/username-tiktokvideoid/`) and saves the downloaded video file (e.g., `username-tiktokvideoid.mp4`) within it. It also creates an initial JSON metadata file with a `processing_status` field set to "PROCESSING" to track the video's progression through the pipeline stages.
 
 2.  **Video Chunking (Preparing the Raw Data):**
 
     - The downloaded video is segmented into smaller, manageable chunks using `chunk_by_scenes.py`.
     - **Scene Detection & Fallback:** The script utilizes the `PySceneDetect` library (specifically, the `ContentDetector`) to attempt detecting natural scene boundaries based on changes in content.
     - If it detects very few or no distinct scene changes (less than or equal to 1), indicating a static scene or detection limitations, it automatically falls back to splitting the video into **fixed-duration chunks** (e.g., 4 seconds each) to ensure the entire video is processed.
-    - **Chunk Saving:** Each resulting video segment (whether from scene detection or fixed splitting) is saved as a separate `.mp4` file (e.g., `videoname-Scene-001.mp4`) within a `chunks` subdirectory (e.g., `videos/username-videoid/chunks/`). It leverages NVENC hardware acceleration for faster chunk creation if available.
+    - **Chunk Saving:** Each resulting video segment (whether from scene detection or fixed splitting) is saved as a separate `.mp4` file (e.g., `<video_id>-Scene-001.mp4`) within a `chunks` subdirectory (e.g., `videos/<video_id>/chunks/`). It leverages NVENC hardware acceleration for faster chunk creation if available.
     - **Metadata Generation:** The script calculates and stores detailed metadata that includes temporal information including:
       Top Level:
-      - `video_name`: name of video file (e.g. `username-videoid.mp4`)
+      - `video_id`: id of video in the format <TIKTOK_USER_NAME>-<TIKTOK_VIDEO_ID>
       - `num_chunks`: total number of video chunks
       - `total_duration_seconds`: Total video duration at the top level of the JSON
       - `chunks`: array of `chunk` JSON objects (see below for full details)
         Each `chunk` JSON object in the `chunks` array contains:
-        - `chunk_name`: name of chunk file (e.g. `username-videoid-Scene-001.mp4`)
+        - `chunk_name`: name of chunk file (e.g. `<video_id>-Scene-001.mp4`)
         - `start_timestamp` and `end_timestamp`: Formatted as "MM:SS.fff" for human readability
         - `chunk_number`: The sequential position of the chunk in the video (1-based index)
         - `chunk_duration_seconds`: The precise duration of each chunk in seconds
         - `normalized_start_time` and `normalized_end_time`: Values between 0.0 and 1.0 representing the relative position within the video
-    - This comprehensive **JSON metadata file** (e.g., `videos/username-videoid/username-videoid.json`) serves as the manifest for all subsequent processing steps.
+    - This comprehensive **JSON metadata file** (e.g., `videos/<video_id>/<video_id>.json`) serves as the manifest for all subsequent processing steps.
 
 3.  **Caption Generation & Video Summarization (Building the Agent's Knowledge Base - Part 1):**
 
@@ -98,7 +98,7 @@ Here's a more detailed breakdown of the implemented technical steps that support
 
     - When a user query is received (demonstrated with a sample question in `index_and_retrieve.py`), the retrieval process begins.
     - **Query Embedding:** The natural language query is converted into a vector embedding using the _same_ OpenAI embedding model (`text-embedding-ada-002`) that was used to embed the captions. This ensures the query vector resides in the same semantic space as the indexed caption vectors.
-    - **Similarity Search & Filtering:** The script queries the Pinecone index using the generated query vector. It requests the `top_k` (e.g., top 3) most similar caption vectors based on cosine similarity (or the metric defined for the index). Crucially, it **filters the search to only include chunks belonging to the specific `video_name`** (extracted from the video's JSON metadata) being queried. This ensures relevance to the current video context.
+    - **Similarity Search & Filtering:** The script queries the Pinecone index using the generated query vector. It requests the `top_k` (e.g., top 3) most similar caption vectors based on cosine similarity (or the metric defined for the index). Crucially, it **filters the search to only include chunks belonging to the specific `video_id`** (extracted from the video's JSON metadata) being queried. This ensures relevance to the current video context.
     - **Context Retrieval:** Crucially, the query specifies `include_metadata=True`. This ensures that Pinecone returns not only the relevant vector IDs and their similarity scores but also the associated metadata (the actual caption text, timestamps, chunk name) that was stored during indexing. This retrieved metadata provides the necessary context for the next stage of answer generation.
 
 6.  **Retrieval Augmentation & Context Assembly (`index_and_retrieve.py` -> `intermediate_prompt.txt`):**

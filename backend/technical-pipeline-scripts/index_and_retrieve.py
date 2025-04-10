@@ -23,12 +23,12 @@ embed_model_name = "text-embedding-ada-002"
 embed_dim = 1536
 batch_size = 100
 
-# json_file_path = Path("videos/tiyonaaa1-7488793321310113066/tiyonaaa1-7488793321310113066.json")
+json_file_path = Path("videos/tiyonaaa1-7488793321310113066/tiyonaaa1-7488793321310113066.json")
 # json_file_path = Path("videos/aichifan33-7486040114695507242/aichifan33-7486040114695507242.json")
 # json_file_path = Path("videos/jadewellz-7485227592648248622/jadewellz-7485227592648248622.json")
 # json_file_path = Path("videos/petfunnyrecording507-7457352740675620139/petfunnyrecording507-7457352740675620139.json")
 # json_file_path = Path("videos/zachchoicook6-7485701580923145494/zachchoicook6-7485701580923145494.json")
-json_file_path = Path("videos/brad_podray-7488978108121500958/brad_podray-7488978108121500958.json")
+# json_file_path = Path("videos/brad_podray-7488978108121500958/brad_podray-7488978108121500958.json")
 
 TEST_QUERY = "Who's the kid in the video? What TV show is this from?"
 # Initialize global clients
@@ -171,9 +171,10 @@ def process_and_index_data(json_file_path: Path):
             raise
 
     # Extract caption chunks
-    video_name = data.get("video_name")
-    if not video_name:
-        raise ValueError(f"No valid 'video_name' found in {json_file_path}.")
+    video_id = data.get("video_id")
+
+    if not video_id:
+        raise ValueError(f"No valid 'video_id' found in {json_file_path}.")
     chunks = data.get("chunks") or []
     if not isinstance(chunks, list) or not chunks:
         raise ValueError(f"No valid 'chunks' list found in {json_file_path}.")
@@ -281,7 +282,7 @@ def process_and_index_data(json_file_path: Path):
                 "start_timestamp": chunk.get("start_timestamp", "Unknown"),
                 "end_timestamp": chunk.get("end_timestamp", "Unknown"),
                 "chunk_name": chunk_name,
-                "video_name": video_name,
+                "video_id": video_id,
                 "normalized_start_time": chunk.get("normalized_start_time", "Unknown"),
                 "normalized_end_time": chunk.get("normalized_end_time", "Unknown"),
                 "chunk_duration_seconds": chunk.get("chunk_duration_seconds", "Unknown"),
@@ -415,25 +416,27 @@ def query_and_get_context(query: str, top_k: int = 3, json_file_path: Path = jso
     start_time = time.time()
     print(f"\n--- Processing Query: '{query}' ---")
     
-    # Load video summary and video_name from JSON
+    # Load video summary and video_id from JSON
     try:
         with open(json_file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             video_summary = data.get("overall_summary", "No summary available for this video.")
-            video_name = data.get("video_name", "")
+            video_id = data.get("video_id", "")
+            # Extract TikTok user_name from video_id
+            user_name = video_id.split('-')[0] if '-' in video_id else None
             num_chunks = data.get("num_chunks", "")
             if num_chunks: 
                 num_chunks = f'/{num_chunks}'
             key_themes = data.get("key_themes", "")
             total_duration = data.get("total_duration_seconds", "")
                 
-        if not video_name:
-            print(f"Warning: No video_name found in {json_file_path}")
+        if not video_id:
+            print(f"Warning: No video_id found in {json_file_path}")
             
     except Exception as e:
         print(f"Warning: Could not load video data: {e}")
         video_summary = "No summary available for this video."
-        video_name = ""
+        video_id = ""
     
     # Embed the query
     try:
@@ -449,26 +452,26 @@ def query_and_get_context(query: str, top_k: int = 3, json_file_path: Path = jso
         print(f"Error embedding query: {e}")
         raise RuntimeError("Failed to embed query") from e
 
-    # Query Pinecone with video_name filter
+    # Query Pinecone with video_id filter
     try:
-        print(f"Retrieving top_k={top_k} results from Pinecone for video '{video_name}'...")
+        print(f"Retrieving top_k={top_k} results from Pinecone for video '{video_id}'...")
         start_retrieve = time.time()
         
         # Create filter to only retrieve chunks from this specific video
-        filter_params = {"video_name": video_name}
-        # filter_params = {"video_name": {"$eq": video_name}} # example filter with operator
+        filter_params = {"video_id": video_id}
+        # filter_params = {"video_id": {"$eq": video_id}} # example filter with operator
         
         query_results = pinecone_index.query(
             vector=query_vector,
             top_k=top_k,
             include_metadata=True,
-            filter=filter_params  # Add filter by video_name
+            filter=filter_params  # Add filter by video_id
         )
         end_retrieve = time.time()
         print(f"Pinecone query took: {end_retrieve - start_retrieve:.4f} seconds")
         
         retrieved_chunks = query_results.get('matches', [])
-        print(f"Retrieved {len(retrieved_chunks)} chunks for video '{video_name}'")
+        print(f"Retrieved {len(retrieved_chunks)} chunks for video '{video_id}'")
         
         # Sort retrieved chunks by sequence number
         if retrieved_chunks:
@@ -479,8 +482,13 @@ def query_and_get_context(query: str, top_k: int = 3, json_file_path: Path = jso
         context_parts = []
         context_parts.append("Video Summary:")
         context_parts.append(video_summary)
+
+        # Add user_name to context
+        if user_name:
+            context_parts.append(f"\nUsername of TikTok account that posted this video:\n{user_name}")
+
         if key_themes:
-            context_parts.append("\nKey Themes:")
+            context_parts.append("\nKey Video Themes:")
             context_parts.append(key_themes)
 
         if total_duration:

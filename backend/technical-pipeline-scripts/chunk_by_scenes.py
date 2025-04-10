@@ -110,13 +110,13 @@ def detect_and_split(video_path, output_dir=None, fixed_chunk_duration=4.0):
     # --- Start: Prepare JSON Metadata ---
     video_dir = os.path.dirname(video_path)
     video_basename = os.path.basename(video_path)
-    video_name_without_extension = os.path.splitext(video_basename)[0]
+    video_id = os.path.splitext(video_basename)[0]
 
-    json_output_path = os.path.join(video_dir, f"{video_name_without_extension}.json")
+    json_output_path = os.path.join(video_dir, f"{video_id}.json")
     
     num_chunks = len(scene_list)
     chunks_metadata = []
-    output_template = '$VIDEO_NAME-Scene-$SCENE_NUMBER.mp4' # Default template
+    output_template = '$VIDEO_ID-Scene-$SCENE_NUMBER.mp4' # Default template
     
     # Calculate total video duration in seconds for normalization
     total_duration_seconds = video.duration.get_seconds()
@@ -125,7 +125,7 @@ def detect_and_split(video_path, output_dir=None, fixed_chunk_duration=4.0):
     print(f"Preparing metadata for {num_chunks} chunks...")
     for i, (start_tc, end_tc) in enumerate(scene_list):
         scene_number = i + 1
-        chunk_name = output_template.replace('$VIDEO_NAME', video_name_without_extension)\
+        chunk_name = output_template.replace('$VIDEO_ID', video_id)\
                                     .replace('$SCENE_NUMBER', f'{scene_number:03d}')
 
         # Format timestamps as MM:SS.nnn
@@ -155,7 +155,7 @@ def detect_and_split(video_path, output_dir=None, fixed_chunk_duration=4.0):
 
         chunks_metadata.append({
             "chunk_name": chunk_name,
-            "video_name": video_basename,
+            "video_id": video_id,
             "start_timestamp": start_ts_str,
             "end_timestamp": end_ts_str,
             "chunk_number": scene_number,  # 1-based index of the chunk
@@ -201,10 +201,10 @@ def detect_and_split(video_path, output_dir=None, fixed_chunk_duration=4.0):
 
     # --- Start: Modified logging for saved chunks ---
     print(f"Verifying chunks for {os.path.basename(video_path)}...") 
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    video_id = os.path.splitext(os.path.basename(video_path))[0]
     # Adjust template based on detection method? No, keep standard naming.
-    # $VIDEO_NAME-Scene-$SCENE_NUMBER.mp4 is the default template used by split_video_ffmpeg
-    output_template = '$VIDEO_NAME-Scene-$SCENE_NUMBER.mp4' 
+    # $VIDEO_ID-Scene-$SCENE_NUMBER.mp4 is the default template used by split_video_ffmpeg
+    output_template = '$VIDEO_ID-Scene-$SCENE_NUMBER.mp4' 
     successful_chunks = 0 
     failed_chunks = [] 
 
@@ -216,7 +216,7 @@ def detect_and_split(video_path, output_dir=None, fixed_chunk_duration=4.0):
     for i in range(total_expected_chunks): 
         scene_number = i + 1 
         expected_filename = output_template\
-            .replace('$VIDEO_NAME', video_name)\
+            .replace('$VIDEO_ID', video_id)\
             .replace('$SCENE_NUMBER', f'{scene_number:03d}') 
 
         expected_filepath = os.path.join(output_dir, expected_filename)

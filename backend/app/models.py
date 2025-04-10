@@ -5,7 +5,7 @@ from typing import List, Optional
 # --- Request Models ---
 
 class QueryRequest(BaseModel):
-    video_id: str = Field(..., description="The unique identifier of the pre-processed video.")
+    video_id: str = Field(..., description="The unique identifier of the processed video.")
     user_query: str = Field(..., description="The question asked by the user.")
 
 class ProcessRequest(BaseModel):
@@ -51,11 +51,11 @@ class ChunkMetadata(BaseModel):
 
 class VideoMetadata(BaseModel):
     video_id: str
-    source_url: str
+    source_url: Optional[str] = None
     overall_summary: Optional[str] = None
-    key_themes: Optional[List[str]] = None
+    key_themes: Optional[str] = None
     total_duration_seconds: Optional[float] = None
     chunks: List[ChunkMetadata] = []
     processing_status: Optional[str] = None
-    interactions: List[Interaction] = []
+    # interactions: List[Interaction] = [] # interactions are in a separate S3 JSON file
 
