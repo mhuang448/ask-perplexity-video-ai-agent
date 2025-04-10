@@ -3,6 +3,9 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import random
 import uuid
+import boto3
+import json
+from botocore.exceptions import ClientError
 from datetime import datetime, timezone
 
 # Import models, utils, and pipeline logic
@@ -45,11 +48,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Placeholder for listing preprocessed videos ---
-# TODO: Implement this properly, e.g., by listing S3 keys or reading config
-def get_list_of_preprocessed_video_ids_stub() -> list[str]:
-    print("Warning: Using hardcoded list of processed video names")
-    return [f"processed_video_{i}" for i in range(1, 11)] # Example names
+# Helper function to list processed videos from S3
+def get_list_of_processed_video_ids():
+    """
+    Retrieve list of processed video IDs from S3 by scanning the video-data/ prefix 
+    and checking the processing_status in each video's JSON metadata file.
+    """
+    try:
+        s3_client = boto3.client('s3', 
+                                region_name=CONFIG['aws_region'],
+                                aws_access_key_id=CONFIG.get('aws_access_key_id'),
+                                aws_secret_access_key=CONFIG.get('aws_secret_access_key'))
+        
+        # List all objects with prefix video-data/
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(
+            Bucket=CONFIG['s3_bucket_name'],
+            Prefix='video-data/',
+            Delimiter='/'
+        )
+        
+        # Extract video IDs from common prefixes (folders)
+        video_ids = []
+        for page in pages:
+            if 'CommonPrefixes' in page:
+                for prefix in page['CommonPrefixes']:
+                    # Extract video_id from the prefix path
+                    prefix_path = prefix['Prefix']  # e.g., 'video-data/username-videoId/'
+                    video_id = prefix_path.strip('/').split('/')[-1]  # Get 'username-videoId'
+                    
+                    # Check if this video has a JSON file with FINISHED status
+                    json_key = f"video-data/{video_id}/{video_id}.json"
+                    try:
+                        response = s3_client.get_object(
+                            Bucket=CONFIG['s3_bucket_name'],
+                            Key=json_key
+                        )
+                        metadata = json.loads(response['Body'].read().decode('utf-8'))
+                        
+                        # Only include videos with FINISHED processing status
+                        if metadata.get('processing_status') == "FINISHED":
+                            video_ids.append(video_id)
+                    except ClientError as e:
+                        print(f"Error reading JSON for {video_id}: {e}")
+                        continue
+        
+        return video_ids
+    except Exception as e:
+        print(f"Error listing processed videos: {e}")
+        return []
 
 
 # --- API Endpoints ---
@@ -62,22 +109,24 @@ async def read_root():
 
 @app.get("/api/videos/foryou", response_model=list[VideoInfo], tags=["Videos"])
 async def get_for_you_videos():
-    """Returns a list of 3 random pre-processed video IDs and public S3 URLs."""
+    """Returns a list of 3 random pre-processed video IDs and their public S3 URLs."""
     try:
-        # Replace stub with actual implementation later
-        all_preprocessed_ids = get_list_of_preprocessed_video_ids_stub()
-        if not all_preprocessed_ids:
+        # Get videos with FINISHED processing status
+        all_processed_ids = get_list_of_processed_video_ids()
+        if not all_processed_ids:
             return []
 
-        sample_size = min(len(all_preprocessed_ids), 3)
-        selected_ids = random.sample(all_preprocessed_ids, sample_size)
+        # Get a random sample of up to 3 videos
+        sample_size = min(len(all_processed_ids), 3)
+        selected_ids = random.sample(all_processed_ids, sample_size)
 
         s3_bucket = CONFIG["s3_bucket_name"]
+        aws_region = CONFIG["aws_region"]
+        
         videos = []
         for video_id in selected_ids:
-            # Construct the public S3 URL (ensure bucket/objects are public and CORS enabled on S3)
-            # Note: Using virtual-hosted style URL (bucket name in domain)
-            video_url = f"https://{s3_bucket}.s3.{CONFIG['aws_region']}.amazonaws.com/{get_s3_video_base_path(video_id)}.mp4"
+            # Construct direct public S3 URL (since bucket policy allows public read for MP4s)
+            video_url = f"https://{s3_bucket}.s3.{aws_region}.amazonaws.com/video-data/{video_id}/{video_id}.mp4"
             videos.append(VideoInfo(video_id=video_id, video_url=video_url))
 
         return videos

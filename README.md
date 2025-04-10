@@ -31,6 +31,7 @@ This project demonstrates a TikTok-style video feed application where users can 
 - **Storage (AWS S3):** Stores video data under a `video-data/` prefix. Each processed video gets a dedicated folder `video-data/<video_id>/`. This folder contains:
   - `<video_id>.json`: Metadata file holding video details (e.g., captions, summary, themes) and the overall `processing_status` (`PROCESSING` or `FINISHED`). This file is separate from interaction data to reduce concurrency issues.
   - `interactions.json`: A separate file containing an array of user Q&A interactions. Created upon the first query to a video, and updated with each subsequent query. Each interaction includes the query, status (`processing`, `completed`, `failed`), AI answer, timestamps, and `interaction_id`. Keeping interactions separate from video metadata prevents conflicts when processing multiple queries simultaneously.
+  - **S3 Bucket Policy:** The bucket is configured with a policy that grants public read access to all MP4 files in the `video-data/` prefix. This allows direct use of S3 object URLs for video display without requiring pre-signed URLs or authentication.
 - **Video ID Format:** Each video is uniquely identified by a `video_id` that combines the TikTok username and video ID from the URL, separated by a dash. For example, from the URL `https://www.tiktok.com/@aichifan33/video/7486040114695507242`, the `video_id` would be `aichifan33-7486040114695507242`.
 - **Vector DB (Pinecone):** Stores video caption embeddings for fast retrieval.
 - **AI Services:** Gemini (Captions), OpenAI (Embeddings, Synthesis), Perplexity (MCP - Reasoning/Search).
@@ -62,19 +63,67 @@ This project demonstrates a TikTok-style video feed application where users can 
 
 1.  **Prerequisites:** Ensure accounts/API keys for AWS, Pinecone, OpenAI, Google Cloud (Gemini), Perplexity. Install Node.js, Python, Docker, Git, AWS CLI.
 2.  **Process Initial Videos:** Manually run scripts or use the process endpoint. Ensure for each video, `<video_id>.json` exists in `s3://<your-bucket>/video-data/<video_id>/` with `processing_status: FINISHED`. The `interactions.json` file should _not_ exist initially; it will be created upon the first query. Ensure chunk captions are indexed into Pinecone.
-3.  **Backend:**
+3.  **S3 Configuration:**
+    - Create an S3 bucket and configure a bucket policy that allows public read access to all objects with the `.mp4` extension under the `video-data/` prefix.
+    - Example bucket policy snippet:
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::<your-bucket-name>/video-data/*/*.mp4"
+          }
+        ]
+      }
+      ```
+    - Configure CORS on your S3 bucket to allow direct video loading from your frontend domain:
+      ```json
+      [
+        {
+          "AllowedHeaders": ["*"],
+          "AllowedMethods": ["GET"],
+          "AllowedOrigins": ["https://your-frontend-domain.com"],
+          "ExposeHeaders": []
+        }
+      ]
+      ```
+4.  **Backend:**
     - `cd backend`
     - Create/populate `.env` with secrets for local testing.
     - `pip install -r requirements.txt`
     - Local Test: `uvicorn app.main:app --reload`
     - Deploy: Build/push Docker image to ECR, deploy via AWS App Runner (configure Env Vars & IAM Role).
-4.  **Frontend:**
+    - **CORS Configuration:** Update the `origins` list in `app/main.py` to include your frontend domain:
+      ```python
+      origins = [
+          "http://localhost:3000",  # For local development
+          "https://your-frontend-domain.com",  # Your deployed frontend URL
+      ]
+      ```
+5.  **Frontend:**
     - `cd frontend`
     - Create `.env.local`, add `NEXT_PUBLIC_API_BASE_URL=<your_deployed_backend_url>`.
     - `npm install`
     - Local Test: `npm run dev` (ensure backend is running/deployed).
     - Deploy: Connect repo to Vercel, set Root Directory to `frontend`, configure `NEXT_PUBLIC_API_BASE_URL`.
-5.  **CORS:** Configure CORS on AWS S3 bucket (allow GET from frontend domain for objects under `video-data/`) and in backend FastAPI `main.py` (allow requests from frontend domain).
+
+## CORS Configuration
+
+This application requires CORS configuration in two places due to its architecture:
+
+1. **Backend API CORS (FastAPI):** Because your frontend and backend run on different domains (e.g., `your-app.vercel.app` and `xxx.awsapprunner.com`), the browser would normally block API requests from the frontend to the backend due to the Same-Origin Policy. The CORS middleware in FastAPI needs to be configured to explicitly allow requests from your frontend domain for these API endpoints:
+
+   - `GET /api/videos/foryou` - For fetching the video feed
+   - `POST /api/query/async` - For submitting queries to preprocessed videos
+   - `POST /api/process_and_query/async` - For processing new videos and queries
+   - `GET /api/query/status/{video_id}` - For polling query status
+
+2. **S3 CORS:** Since the frontend directly loads videos from S3 URLs, the S3 bucket needs CORS configuration to allow requests from your frontend domain.
+
+Without proper CORS configuration, your application will fail with errors like "Access to fetch at 'https://xxx.awsapprunner.com/api/videos/foryou' from origin 'https://your-app.vercel.app' has been blocked by CORS policy."
 
 ## Key Trade-offs to prioritize speed of development (to be improved in future)
 
