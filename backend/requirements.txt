@@ -17,3 +17,7 @@ pinecone[grpc]
 openai
 
 mcp
+
+httpx
+httpx-sse
+anthropic

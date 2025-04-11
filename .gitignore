@@ -7,3 +7,5 @@
 deprecated/
 
 video_ids.txt
+
+node_modules/

@@ -12,7 +12,7 @@ from .utils import (
     S3_CLIENT, CONFIG, get_s3_json_path, get_s3_interactions_path,
     OPENAI_CLIENT, PINECONE_INDEX,
     ANTHROPIC_CLIENT, # Added Anthropic client (optional)
-    get_mcp_server_params # Added MCP helper
+    # get_mcp_server_params, # Added MCP helper function (deprecated due to switch from JSON to SSE URL)
 )
 from .models import VideoMetadata, Interaction # Import Pydantic models for structure
 
@@ -21,13 +21,48 @@ from openai import OpenAIError
 from pinecone.exceptions import PineconeException
 # Import MCP components
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
+# from mcp.client.stdio import stdio_client # legacy import
 # Import Anthropic specific exceptions
 from anthropic import APIError as AnthropicAPIError
+# Import httpx exceptions for sse_client error handling
+import httpx
+
+from pprint import pprint # for debugging
+from collections.abc import Mapping # for debugging
+import inspect # for debugging
 
 # Placeholder imports for AI clients - replace with actual imports
 # import pinecone
 # import openai
+
+
+def deep_vars(obj, visited=None):
+    if visited is None:
+        visited = set()
+
+    # Prevent circular references
+    if id(obj) in visited:
+        return "<Circular Reference>"
+    visited.add(id(obj))
+
+    # If the object is a mapping (like a dict)
+    if isinstance(obj, Mapping):
+        return {k: deep_vars(v, visited) for k, v in obj.items()}
+    # If the object has a __dict__ attribute, process its attributes
+    elif hasattr(obj, '__dict__'):
+        # Optionally, filter out "private" attributes (those beginning with an underscore)
+        result = {}
+        for key, value in vars(obj).items():
+            if key.startswith('_'):
+                continue  # Skip private attributes; remove this check if you want them too.
+            result[key] = deep_vars(value, visited)
+        return result
+    # If the object is a list, tuple, or set, iterate through its items
+    elif isinstance(obj, (list, tuple, set)):
+        return type(obj)(deep_vars(item, visited) for item in obj)
+    else:
+        return obj  # Base case: return the object as is
 
 # --- S3 JSON Read/Write Helpers (Crucial for State) ---
 
@@ -474,7 +509,7 @@ async def _select_and_run_tool_llm_based(
     query_context: str,
     anthropic_client: Any # Should be Anthropic client instance
 ) -> str:
-    """Uses Claude to select an MCP tool, determine args, execute it, and return the text result."""
+    """Uses Claude to select an MCP tool, determine args, execute it via the MCP session (SSE/HTTP), and return the text result."""
     if not anthropic_client:
         print("  ERROR: Anthropic client not available for LLM-based tool selection.")
         return "[Error: Anthropic client not configured]"
@@ -483,15 +518,16 @@ async def _select_and_run_tool_llm_based(
 
     try:
         # 1. Get available tools from the MCP session
-        print("  Listing tools for LLM selection...")
-        list_response = await session.list_tools()
+        print("  Listing tools for LLM selection via session...")
+        # Use the provided ClientSession object
+        list_response = await session.list_tools() # list_tools should return ListToolsResult
         available_tools = [
             {
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.inputSchema
             }
-            for tool in list_response.tools
+            for tool in getattr(list_response, 'tools', []) # Safely access tools attribute
         ]
         if not available_tools:
             print("  Warning: No tools available from MCP server.")
@@ -516,15 +552,16 @@ async def _select_and_run_tool_llm_based(
                 if content_block.type == 'tool_use':
                     tool_name = content_block.name
                     tool_args = content_block.input
-                    tool_use_id = content_block.id
+                    # tool_use_id = content_block.id # Keep if needed for context
                     print(f"  LLM selected tool: '{tool_name}' with args: {tool_args}")
                     tool_called = True
 
                     # 4. Execute the selected tool via MCP session
-                    print(f"  Calling tool '{tool_name}' via MCP...")
+                    print(f"  Calling tool '{tool_name}' via MCP SSE session...")
                     tool_call_start = time.time()
                     try:
-                        tool_exec_result = await session.call_tool(tool_name, tool_args)
+                        # Use the provided ClientSession object
+                        tool_exec_result = await session.call_tool(tool_name, tool_args) # Returns CallToolResult
                         tool_call_end = time.time()
                         print(f"  Tool call finished in {tool_call_end - tool_call_start:.2f} seconds.")
 
@@ -541,15 +578,19 @@ async def _select_and_run_tool_llm_based(
                             tool_result_text = f"[Tool '{tool_name}' returned no information]"
 
                     except Exception as e:
-                        print(f"  Unexpected ERROR calling tool '{tool_name}': {e}")
+                        print(f"  Unexpected ERROR calling tool '{tool_name}' via an SSE session: {e}")
                         tool_result_text = f"[Unexpected error executing tool '{tool_name}']"
 
                     # Assuming we only process the first tool call requested by Claude in this pass
                     break # Exit loop after handling the first tool_use block
-
             if not tool_called:
                  print("  LLM did not request any tool calls.")
-                 # tool_result_text remains as the default message
+                 # Check if Claude provided a text response directly
+                 for content_block in claude_response.content:
+                     if content_block.type == 'text':
+                         tool_result_text = content_block.text.strip()
+                         print(f"  LLM provided direct text response (length: {len(tool_result_text)} chars).")
+                         break # Use the first text block
 
     except AnthropicAPIError as ae:
         print(f"  ERROR: Anthropic API error during tool selection: {ae}")
@@ -565,74 +606,109 @@ async def _call_mcp(
     mcp_server_name: str = "perplexity-ask",
     use_llm_selection: bool = True # Default to LLM-based selection
 ) -> str:
-    """Connects to a specified MCP server (via stdio), selects and calls a tool
-       (either rule-based or LLM-based), and returns the text result.
-       
-       WARNING: Uses stdio_client, suitable for local testing but NOT recommended for production.
+    """Connects to the configured MCP server URL via SSE/HTTP, establishes a session,
+       selects and calls a tool, and returns the text result.
     """
-    print(f"Calling MCP server '{mcp_server_name}' (LLM Selection: {use_llm_selection})...")
-    server_params = get_mcp_server_params(mcp_server_name)
-    if not server_params:
-        raise ValueError(f"MCP Server configuration '{mcp_server_name}' not found or invalid.")
+    mcp_sse_url = CONFIG.get("mcp_perplexity_sse_url")
+    if not mcp_sse_url:
+        print("ERROR: MCP_PERPLEXITY_SSE_URL environment variable is not set.")
+        return "[Error: MCP Server URL not configured]"
 
-    mcp_result_text = "" # Initialize
+    print(f"Connecting to MCP server via SSE at '{mcp_sse_url}' (LLM Selection: {use_llm_selection})...")
+    mcp_result_text = "[MCP call failed]"
 
     try:
-        async with AsyncExitStack() as stack:
-            print(f"  Connecting to MCP server process: {server_params.command} {server_params.args}")
-            # PRODUCTION NOTE: Use network client in production
-            stdio_transport = await stack.enter_async_context(stdio_client(server_params))
-            stdio, write = stdio_transport
-            session = await stack.enter_async_context(ClientSession(stdio, write))
+        # Use the sse_client context manager which handles HTTP GET/POST
+        async with sse_client(mcp_sse_url) as streams:
+            read_stream, write_stream = streams
+            print("  SSE client connection established, creating session object...") # Added log
 
-            await session.initialize()
-            print("  MCP session initialized.")
-
-            if use_llm_selection:
-                # --- LLM-Based Tool Selection --- 
-                mcp_result_text = await _select_and_run_tool_llm_based(
-                    session,
-                    intermediate_prompt, # Pass the combined query + video context
-                    ANTHROPIC_CLIENT
-                )
-            else:
-                # --- Rule-Based Tool Selection (Existing Logic) --- 
-                selected_tool = _select_perplexity_tool_rule_based(intermediate_prompt)
-                print(f"  Calling tool '{selected_tool}' via MCP (rule-based selection)...")
-                tool_call_start = time.time()
+            # Create a ClientSession using the streams from sse_client
+            async with ClientSession(*streams) as session:
+                print("================================================")
+                print("  DEBUG: Session object created successfully.")
+                print("================================================")
+                print(f"  DEBUG: Session object:\n{session}")
+                print(f"  DEBUG: Session object attributes:")
+                # attributes = deep_vars(session)
+                # pprint(attributes, width=120)
+                print(dir(session))
+                print("================================================")
+                # --- EDIT: Add try/except around initialize ---
                 try:
-                    tool_args = {"messages": [{"role": "user", "content": intermediate_prompt}]}
-                    result = await session.call_tool(selected_tool, tool_args)
-                    tool_call_end = time.time()
-                    print(f"  Tool call finished in {tool_call_end - tool_call_start:.2f} seconds.")
-                    
-                    # Extract text content
-                    current_tool_text = ""
-                    if result and result.content:
-                        for part in result.content:
-                            if hasattr(part, 'type') and part.type == 'text' and hasattr(part, 'text'):
-                                current_tool_text += part.text + "\n"
-                        mcp_result_text = current_tool_text.strip()
-                        print(f"  Received text result from '{selected_tool}' (length: {len(mcp_result_text)} chars).")
-                    else:
-                        print(f"  Warning: Tool '{selected_tool}' returned no content.")
-                        mcp_result_text = f"[Tool '{selected_tool}' returned no information]"
-                except Exception as e:
-                    print(f"  Unexpected ERROR calling tool '{selected_tool}': {e}")
-                    mcp_result_text = f"[Unexpected error executing tool '{selected_tool}']"
+                    print("  DEBUG: Attempting session.initialize()...")
+                    await session.initialize() # Initialize the MCP session
+                    # If this next line prints, initialize() returned successfully without Exception
+                    print("  DEBUG: session.initialize() call completed without raising Exception.")
+                except Exception as init_error:
+                    # Log if initialize() itself raises an exception
+                    print(f"  ERROR: Exception caught directly during session.initialize(): {type(init_error).__name__} - {init_error}")
+                    # The "Error in post_writer" might happen *before* this exception is raised,
+                    # but this confirms if the library translates the HTTP error to a Python error.
+                    raise # Re-raise the error after logging
+                # --- END EDIT ---
 
+                print("  MCP session initialized successfully (apparently).") # Modified log
 
+                # Now use the 'session' object to interact
+                if use_llm_selection:
+                    if not ANTHROPIC_CLIENT:
+                        print("  ERROR: Anthropic client not available for LLM-based tool selection.")
+                        return "[Error: Anthropic client not configured]"
+                    # Pass the active session to the LLM selection logic
+                    mcp_result_text = await _select_and_run_tool_llm_based(
+                        session,
+                        intermediate_prompt,
+                        ANTHROPIC_CLIENT
+                    )
+                else:
+                    # Rule-Based Selection using the active session
+                    selected_tool = _select_perplexity_tool_rule_based(intermediate_prompt)
+                    print(f"  Calling tool '{selected_tool}' via MCP session (rule-based)...")
+                    tool_call_start = time.time()
+                    try:
+                        tool_args = {"messages": [{"role": "user", "content": intermediate_prompt}]}
+                        # Use the session object to call the tool
+                        # The result type here is CallToolResult from mcp.types
+                        result = await session.call_tool(selected_tool, tool_args)
+                        tool_call_end = time.time()
+                        print(f"  Tool call finished in {tool_call_end - tool_call_start:.2f} seconds.")
+
+                        # Extract text content from CallToolResult
+                        current_tool_text = ""
+                        if hasattr(result, 'content') and result.content: # Check result structure
+                            for part in result.content:
+                                # Check part structure based on TextContent, ImageContent, etc.
+                                if hasattr(part, 'type') and part.type == 'text' and hasattr(part, 'text'):
+                                    current_tool_text += part.text + "\n"
+                            mcp_result_text = current_tool_text.strip()
+                            print(f"  Received text result from '{selected_tool}' (length: {len(mcp_result_text)} chars).")
+                        else:
+                            print(f"  Warning: Tool '{selected_tool}' returned no content or unexpected structure.")
+                            mcp_result_text = f"[Tool '{selected_tool}' returned no information]"
+                    except Exception as e:
+                        print(f"  Unexpected ERROR calling tool '{selected_tool}' via session: {e}")
+                        mcp_result_text = f"[Unexpected error executing tool '{selected_tool}']"
+
+    except httpx.ConnectError as e:
+        print(f"  ERROR: Connection failed to MCP server at {mcp_sse_url}. Is it running and accessible? Details: {e}")
+        mcp_result_text = f"[Error: Connection failed to MCP server at {mcp_sse_url}]"
+    except httpx.HTTPStatusError as e:
+         print(f"  ERROR: HTTP error {e.response.status_code} received from MCP server {mcp_sse_url}: {e.response.text}")
+         mcp_result_text = f"[Error: HTTP {e.response.status_code} from MCP server]"
     except asyncio.TimeoutError:
-        print("  ERROR: Timeout connecting to or calling MCP server.")
-        mcp_result_text = "[Error: Timeout interacting with MCP server]"
-    except FileNotFoundError:
-        print(f"  ERROR: MCP server command '{server_params.command}' not found. Is Docker running/installed?")
-        mcp_result_text = f"[Error: MCP server command not found]"
+         print(f"  ERROR: Timeout during MCP interaction with {mcp_sse_url}.")
+         mcp_result_text = "[Error: Timeout interacting with MCP server]"
+    # Catch potential MCP specific errors if the library defines them
+    # except McpError as e: # Assuming McpError exists in the library
+    #    print(f"  ERROR: MCP protocol error: {e}")
+    #    mcp_result_text = f"[Error: MCP protocol error - {e}]"
     except Exception as e:
-        print(f"  ERROR: Unexpected error during MCP interaction: {e}")
+        print(f"  ERROR: Unexpected error during MCP interaction: {type(e).__name__} - {e}")
         mcp_result_text = f"[Unexpected error interacting with MCP server: {e}]"
+    finally:
+        print(f"MCP SSE/HTTP interaction complete for server at '{mcp_sse_url}'.")
 
-    print(f"MCP call complete for server '{mcp_server_name}'.")
     return mcp_result_text
 
 def _synthesize_answer(user_query: str, video_context: str, mcp_result: str) -> str:

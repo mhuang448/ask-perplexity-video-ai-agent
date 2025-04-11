@@ -16,6 +16,10 @@ COPY --from=builder /app/package-lock.json /app/package-lock.json
 
 ENV NODE_ENV=production
 
-RUN npm ci --ignore-scripts --omit-dev
+RUN npm ci --ignore-scripts --omit=dev
+
+# --- Ensure correct port is exposed ---
+EXPOSE 8080
+# --- END Ensure ---
 
 ENTRYPOINT ["node", "dist/index.js"]

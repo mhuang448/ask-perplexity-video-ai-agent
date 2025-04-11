@@ -1,12 +1,22 @@
 #!/usr/bin/env node
 
+import express, { type Request, type Response } from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
-  CallToolRequestSchema,
+  type CallToolResult,
+  type ListToolsResult,
+  McpError,
+  ErrorCode,
+  type Tool,
   ListToolsRequestSchema,
-  Tool,
+  CallToolRequestSchema,
+  JSONRPCMessageSchema, // for debugging
 } from "@modelcontextprotocol/sdk/types.js";
+
+import dotenv from "dotenv";
+
+dotenv.config();
 
 /**
  * Definition of the Perplexity Ask Tool.
@@ -29,9 +39,6 @@ This tool provides rapid responses grounded firmly in verifiable truth, leveragi
 - Complex or nuanced topics requiring reasoning or multi-step analysis
 - Questions requiring detailed citations or extensive research support
   `,
-  // "Engages in a conversation using the Sonar API. " +
-  // "Accepts an array of messages (each with a role and content) " +
-  // "and returns a ask completion response from the Perplexity model.",
   inputSchema: {
     type: "object",
     properties: {
@@ -79,9 +86,6 @@ This high-performance tool employs sophisticated multi-step chain-of-thought (Co
 - Extremely simple, factual queries where \`perplexity_ask\` tool would suffice
 - Very in-depth or scholarly research needing extensive citations and exhaustive detail
   `,
-  // "Performs reasoning tasks using the Perplexity API. " +
-  // "Accepts an array of messages (each with a role and content) " +
-  // "and returns a well-reasoned response using the sonar-reasoning-pro model."
   inputSchema: {
     type: "object",
     properties: {
@@ -129,9 +133,6 @@ This tool provides exhaustive, deeply researched answers supported by detailed c
 - Queries needing rapid response or that involve relatively straightforward information
 - Moderately complex tasks manageable by \`perplexity_reasoning\` tool's advanced reasoning capabilities  
   `,
-  // "Performs deep research using the Perplexity API. " +
-  // "Accepts an array of messages (each with a role and content) " +
-  // "and returns a comprehensive research response with citations.",
   inputSchema: {
     type: "object",
     properties: {
@@ -179,16 +180,13 @@ async function performChatCompletion(
   messages: Array<{ role: string; content: string }>,
   model: string = "sonar-pro"
 ): Promise<string> {
-  // Construct the API endpoint URL and request body
   const url = new URL("https://api.perplexity.ai/chat/completions");
   const body = {
-    model: model, // Model identifier passed as parameter
+    model: model,
     messages: messages,
-    // Additional parameters can be added here if required (e.g., max_tokens, temperature, etc.)
-    // See the Sonar API documentation for more details:
-    // https://docs.perplexity.ai/api-reference/chat-completions
   };
 
+  console.error(`Calling Perplexity API (model: ${model})...`);
   let response;
   try {
     response = await fetch(url.toString(), {
@@ -200,180 +198,250 @@ async function performChatCompletion(
       body: JSON.stringify(body),
     });
   } catch (error) {
+    console.error("Network error calling Perplexity API:", error);
     throw new Error(`Network error while calling Perplexity API: ${error}`);
   }
 
-  // Check for non-successful HTTP status
   if (!response.ok) {
-    let errorText;
+    let errorText = "Unknown API error";
     try {
       errorText = await response.text();
     } catch (parseError) {
-      errorText = "Unable to parse error response";
+      console.error("Failed to parse error response from Perplexity API");
     }
+    console.error(
+      `Perplexity API error: ${response.status} ${response.statusText}`,
+      errorText
+    );
     throw new Error(
       `Perplexity API error: ${response.status} ${response.statusText}\n${errorText}`
     );
   }
 
-  // Attempt to parse the JSON response from the API
   let data;
   try {
     data = await response.json();
   } catch (jsonError) {
+    console.error(
+      "Failed to parse JSON response from Perplexity API:",
+      jsonError
+    );
     throw new Error(
       `Failed to parse JSON response from Perplexity API: ${jsonError}`
     );
   }
 
-  // Directly retrieve the main message content from the response
-  let messageContent = data.choices[0].message.content;
+  console.error(`Perplexity API call successful (model: ${model}).`);
+  let messageContent =
+    data.choices[0]?.message?.content ?? "[No content received]";
 
-  // If citations are provided, append them to the message content
   if (
     data.citations &&
     Array.isArray(data.citations) &&
     data.citations.length > 0
   ) {
     messageContent += "\n\nCitations:\n";
-    data.citations.forEach((citation: string, index: number) => {
-      messageContent += `[${index + 1}] ${citation}\n`;
+    data.citations.forEach((citation: any, index: number) => {
+      messageContent += `[${index + 1}] ${JSON.stringify(citation)}\n`;
     });
   }
 
   return messageContent;
 }
 
-// Initialize the server with tool metadata and capabilities
 const server = new Server(
   {
-    name: "example-servers/perplexity-ask",
+    name: "perplexity-mcp-server",
     version: "0.1.0",
   },
   {
     capabilities: {
-      tools: {},
+      // tools: {},
+      tools: { listChanged: false },
+      // Add capabilities the Python client sends during initialize
+      sampling: {}, // Assuming empty object is sufficient declaration
+      roots: { listChanged: true }, // Match what Python client sends
     },
   }
 );
 
-/**
- * Registers a handler for listing available tools.
- * When the client requests a list of tools, this handler returns all available Perplexity tools.
- */
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    PERPLEXITY_ASK_TOOL,
-    PERPLEXITY_REASON_TOOL,
-    // PERPLEXITY_RESEARCH_TOOL, // Don't use this tool for now, takes too long
-  ],
-}));
-
-/**
- * Registers a handler for calling a specific tool.
- * Processes requests by validating input and invoking the appropriate tool.
- *
- * @param {object} request - The incoming tool call request.
- * @returns {Promise<object>} The response containing the tool's result or an error.
- */
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  try {
-    const { name, arguments: args } = request.params;
-    if (!args) {
-      throw new Error("No arguments provided");
-    }
-    switch (name) {
-      case "perplexity_ask": {
-        if (!Array.isArray(args.messages)) {
-          throw new Error(
-            "Invalid arguments for perplexity_ask: 'messages' must be an array"
-          );
-        }
-        // Invoke the chat completion function with the provided messages
-        const messages = args.messages;
-        const result = await performChatCompletion(messages, "sonar-pro");
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      case "perplexity_reason": {
-        if (!Array.isArray(args.messages)) {
-          throw new Error(
-            "Invalid arguments for perplexity_reason: 'messages' must be an array"
-          );
-        }
-        // Invoke the chat completion function with the provided messages using the reasoning model
-        const messages = args.messages;
-        const result = await performChatCompletion(
-          messages,
-          "sonar-reasoning-pro"
-        );
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      // case "perplexity_research": {
-      //   if (!Array.isArray(args.messages)) {
-      //     throw new Error(
-      //       "Invalid arguments for perplexity_research: 'messages' must be an array"
-      //     );
-      //   }
-      //   // Invoke the chat completion function with the provided messages using the deep research model
-      //   const messages = args.messages;
-      //   const result = await performChatCompletion(
-      //     messages,
-      //     "sonar-deep-research"
-      //   );
-      //   return {
-      //     content: [{ type: "text", text: result }],
-      //     isError: false,
-      //   };
-      // }
-      default:
-        // Respond with an error if an unknown tool is requested
-        return {
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-          isError: true,
-        };
-    }
-  } catch (error) {
-    // Return error details in the response
+server.setRequestHandler(
+  ListToolsRequestSchema,
+  async (): Promise<ListToolsResult> => {
+    console.error("Handling tools/list request");
     return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        },
-      ],
-      isError: true,
+      tools: [PERPLEXITY_ASK_TOOL, PERPLEXITY_REASON_TOOL],
     };
+  }
+);
+
+server.setRequestHandler(
+  CallToolRequestSchema,
+  async (request): Promise<CallToolResult> => {
+    const { name, arguments: args } = request.params;
+    console.error(`Handling tools/call request for tool: ${name}`);
+
+    try {
+      if (!args || typeof args !== "object" || args === null) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Arguments must be an object for tool ${name}`
+        );
+      }
+      if (!("messages" in args) || !Array.isArray(args.messages)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Tool ${name} requires a 'messages' array argument`
+        );
+      }
+      const messages = args.messages as Array<{
+        role: string;
+        content: string;
+      }>;
+
+      let resultText: string;
+      switch (name) {
+        case PERPLEXITY_ASK_TOOL.name:
+          console.error(`Calling ${name} implementation...`);
+          resultText = await performChatCompletion(messages, "sonar-pro");
+          break;
+        case PERPLEXITY_REASON_TOOL.name:
+          console.error(`Calling ${name} implementation...`);
+          resultText = await performChatCompletion(
+            messages,
+            "sonar-reasoning-pro"
+          );
+          break;
+        default:
+          console.error(`Unknown tool requested: ${name}`);
+          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
+
+      console.error(`Tool ${name} executed successfully.`);
+      return {
+        content: [{ type: "text", text: resultText }],
+        isError: false,
+      };
+    } catch (error) {
+      console.error(`Error executing tool ${name}:`, error);
+      if (error instanceof McpError) {
+        throw error;
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Tool execution failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+const app = express();
+const port = parseInt(process.env.PORT || "8080", 10);
+
+const transports: { [sessionId: string]: SSEServerTransport } = {};
+
+app.get("/sse", async (req: Request, res: Response) => {
+  console.error(`SSE connection requested from ${req.ip}`);
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    const logPrefix = `[${transport.sessionId}]`;
+
+    transports[transport.sessionId] = transport;
+    console.error(
+      `${logPrefix} SSE transport created with sessionId: ${transport.sessionId}`
+    );
+
+    transport.onerror = (error: Error) => {
+      console.error(`${logPrefix} SSEServerTransport received error:`, error);
+    };
+
+    res.on("close", () => {
+      console.error(`${logPrefix} SSE connection closed.`);
+      delete transports[transport.sessionId];
+      transport
+        .close()
+        .catch((err: Error) =>
+          console.error(`${logPrefix} Error closing transport:`, err)
+        );
+    });
+
+    await server.connect(transport);
+    console.error(`${logPrefix} Server connected to transport.`);
+  } catch (error) {
+    const errorPrefix = `[${
+      (error as any)?.transport?.sessionId ?? "unknown-session"
+    }]`;
+    console.error(`${errorPrefix} Error setting up SSE connection:`, error);
+    if (!res.headersSent) {
+      res.status(500).send("Failed to establish SSE connection");
+    } else {
+      res.end();
+    }
   }
 });
 
-/**
- * Initializes and runs the server using standard I/O for communication.
- * Logs an error and exits if the server fails to start.
- */
-async function runServer() {
-  try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error(
-      // "Perplexity MCP Server running on stdio with Ask, Research, and Reason tools"
-      "Perplexity MCP Server running on stdio with Ask and Reason tools"
-    );
-  } catch (error) {
-    console.error("Fatal error running server:", error);
-    process.exit(1);
-  }
-}
+app.post(
+  "/messages",
+  express.json({ limit: "5mb" }),
+  async (req: Request, res: Response) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) {
+      console.error("POST /messages request missing sessionId query parameter");
+      return res.status(400).send("Missing sessionId query parameter");
+    }
+    const logPrefix = `[${sessionId}]`;
+    const transport = transports[sessionId];
 
-// Start the server and catch any startup errors
-runServer().catch((error) => {
-  console.error("Fatal error running server:", error);
-  process.exit(1);
+    console.error(`${logPrefix} POST request received for /messages`);
+    console.error(
+      `${logPrefix} --> Received body:`,
+      JSON.stringify(req.body, null, 2)
+    );
+
+    if (transport) {
+      try {
+        console.log(
+          `${logPrefix} DEBUG: Attempting transport.handlePostMessage...`
+        );
+        await transport.handlePostMessage(req, res);
+        console.log(
+          `${logPrefix} DEBUG: transport.handlePostMessage potentially completed (response might already be sent).`
+        );
+      } catch (error) {
+        console.error(
+          `${logPrefix} ERROR caught explicitly in POST handler:`,
+          error
+        );
+        if (!res.headersSent) {
+          res.status(500).send("Internal Server Error handling message");
+        }
+      }
+    } else {
+      console.error(`${logPrefix} No active transport found.`);
+      if (!res.headersSent) {
+        res
+          .status(404)
+          .send(`No active transport found for sessionId: ${sessionId}`);
+      }
+    }
+  }
+);
+
+app.get("/health", (req: Request, res: Response) => {
+  console.error("Health check requested");
+  res.status(200).send("OK");
+});
+
+app.listen(port, "0.0.0.0", () => {
+  console.error(`Perplexity MCP Server (HTTP+SSE) listening on port ${port}`);
+  console.error(` -> SSE connections on GET /sse`);
+  console.error(` -> Client messages on POST /messages?sessionId=<sessionId>`);
+  console.error(` -> Health check on GET /health`);
 });

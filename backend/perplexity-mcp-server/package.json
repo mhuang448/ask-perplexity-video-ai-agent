@@ -19,10 +19,17 @@
     "watch": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1"
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "content-type": "^1.0.5",
+    "dotenv": "^16.5.0",
+    "express": "^4.19.2",
+    "raw-body": "^2.5.2"
   },
   "devDependencies": {
+    "@types/content-type": "^1.1.8",
+    "@types/express": "^4.17.21",
     "@types/node": "^22",
+    "@types/raw-body": "latest",
     "shx": "^0.3.4",
     "typescript": "^5.6.2"
   }

@@ -14,9 +14,11 @@ from pinecone.grpc import PineconeGRPC as Pinecone
 from pinecone import ServerlessSpec
 from pinecone.exceptions import PineconeException
 # Added imports for MCP and Anthropic
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from contextlib import AsyncExitStack
+# from mcp import ClientSession, StdioServerParameters # legacy import
+# from mcp.client.stdio import stdio_client # legacy import
+# from contextlib import AsyncExitStack # legacy import
+# from mcp.client.session import ClientSession # legacy import
+from mcp.client.sse import sse_client
 from anthropic import Anthropic, AnthropicError
 
 # Load .env file ONLY for local development.
@@ -26,8 +28,9 @@ load_dotenv()
 # --- Configuration Loading ---
 
 def load_config() -> Dict[str, Any]: # Changed return type hint
-    """Loads configuration from environment variables and mcp_config.json."""
-    # Load from environment variables first
+    """Loads configuration from environment variables.
+       PREVIOUSLY LOADED MCP SERVER CONFIG FROM JSON FILE; this is now deprecated in favor of MCP server SSE URL.
+    """
     config = {
         "aws_region": os.getenv("AWS_REGION", "us-east-2"),
         "s3_bucket_name": os.getenv("S3_BUCKET_NAME"),
@@ -44,55 +47,60 @@ def load_config() -> Dict[str, Any]: # Changed return type hint
         # Add direct AWS keys only if absolutely needed (prefer IAM roles)
         "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
         "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
-        "mcp_servers": {} # Initialize mcp_servers dict
+        # "mcp_servers": {}, # Initialize mcp_servers dict, commenting out for now, reference to deprecated JSON mcp_config.json file
+        # --- EDIT: Replace MCP server command/args with SSE URL ---
+        "mcp_perplexity_sse_url": os.getenv("MCP_PERPLEXITY_SSE_URL"), # e.g., https://<host>/sse
+        # --- END EDIT ---
     }
 
-    # Load MCP server configurations from mcp_config.json
-    # Look for config in standard locations or specified path
-    mcp_config_path = os.getenv("MCP_CONFIG_PATH")
-    default_paths = [
-        "app/mcp_config.json",
-        os.path.expanduser("~/.config/mcp/config.json"), # Example Linux path
-        os.path.expanduser("~/Library/Application Support/MCP/config.json") # Example macOS path
-    ]
+    # Commenting out legacy MCP server config loading from JSON file
+    # Keep here for now for reference
+    # # Load MCP server configurations from mcp_config.json
+    # # Look for config in standard locations or specified path
+    # mcp_config_path = os.getenv("MCP_CONFIG_PATH")
+    # default_paths = [
+    #     "app/mcp_config.json",
+    #     os.path.expanduser("~/.config/mcp/config.json"), # Example Linux path
+    #     os.path.expanduser("~/Library/Application Support/MCP/config.json") # Example macOS path
+    # ]
 
-    # # FOR DEBUGGING:Print the current directory contents (simulate 'ls')
-    # try:
-    #     current_dir = os.getcwd()
-    #     print(f"Current directory: {current_dir}")
-    #     print("Directory contents:")
-    #     for item in os.listdir(current_dir):
-    #         item_path = os.path.join(current_dir, item)
-    #         if os.path.isdir(item_path):
-    #             print(f"  📁 {item}/")
-    #         else:
-    #             print(f"  📄 {item}")
-    # except Exception as e:
-    #     print(f"Error listing directory contents: {e}")
+    # # # FOR DEBUGGING:Print the current directory contents (simulate 'ls')
+    # # try:
+    # #     current_dir = os.getcwd()
+    # #     print(f"Current directory: {current_dir}")
+    # #     print("Directory contents:")
+    # #     for item in os.listdir(current_dir):
+    # #         item_path = os.path.join(current_dir, item)
+    # #         if os.path.isdir(item_path):
+    # #             print(f"  📁 {item}/")
+    # #         else:
+    # #             print(f"  📄 {item}")
+    # # except Exception as e:
+    # #     print(f"Error listing directory contents: {e}")
 
-    found_config_path = None
-    if mcp_config_path and os.path.exists(mcp_config_path):
-        found_config_path = mcp_config_path
-    else:
-        for path in default_paths:
-            print(f"Checking for MCP config at: {path}")
-            if os.path.exists(path):
-                found_config_path = path
-                break
+    # found_config_path = None
+    # if mcp_config_path and os.path.exists(mcp_config_path):
+    #     found_config_path = mcp_config_path
+    # else:
+    #     for path in default_paths:
+    #         print(f"Checking for MCP config at: {path}")
+    #         if os.path.exists(path):
+    #             found_config_path = path
+    #             break
 
-    if found_config_path:
-        print(f"Loading MCP server configurations from: {found_config_path}")
-        try:
-            with open(found_config_path, 'r') as f:
-                mcp_config_data = json.load(f)
-                config["mcp_servers"] = mcp_config_data.get("mcpServers", {})
-                print(f"Loaded {len(config['mcp_servers'])} MCP server configurations.")
-        except json.JSONDecodeError as e:
-            print(f"Warning: Error decoding JSON from {found_config_path}: {e}")
-        except Exception as e:
-            print(f"Warning: Failed to load MCP config from {found_config_path}: {e}")
-    else:
-        print("Warning: No mcp_config.json found in default locations or specified by MCP_CONFIG_PATH.")
+    # if found_config_path:
+    #     print(f"Loading MCP server configurations from: {found_config_path}")
+    #     try:
+    #         with open(found_config_path, 'r') as f:
+    #             mcp_config_data = json.load(f)
+    #             config["mcp_servers"] = mcp_config_data.get("mcpServers", {})
+    #             print(f"Loaded {len(config['mcp_servers'])} MCP server configurations.")
+    #     except json.JSONDecodeError as e:
+    #         print(f"Warning: Error decoding JSON from {found_config_path}: {e}")
+    #     except Exception as e:
+    #         print(f"Warning: Failed to load MCP config from {found_config_path}: {e}")
+    # else:
+    #     print("Warning: No mcp_config.json found in default locations or specified by MCP_CONFIG_PATH.")
 
     # Basic validation
     if not config["s3_bucket_name"]:
@@ -103,6 +111,8 @@ def load_config() -> Dict[str, Any]: # Changed return type hint
         print("Warning: Missing OPENAI_API_KEY environment variable.")
     if not config["perplexity_api_key"]:
          print("Warning: Missing PERPLEXITY_API_KEY environment variable (needed for Perplexity MCP server).")
+    if not config["mcp_perplexity_sse_url"]:
+         print("Warning: Missing MCP_PERPLEXITY_SSE_URL environment variable (URL of the deployed Perplexity MCP server's /sse endpoint).")
     # Anthropic key is optional if only using rule-based selection
     # if not config["anthropic_api_key"]:
     #     print("Warning: Missing ANTHROPIC_API_KEY environment variable (needed for Claude tool selection).")
@@ -243,63 +253,65 @@ def get_anthropic_client():
 
 ANTHROPIC_CLIENT = get_anthropic_client()
 
-# --- MCP Helper Functions ---
+# # --- MCP Helper Functions ---
+# Commenting out legacy MCP server config loading from JSON file
+# Keep here for now for reference
 
-def get_mcp_server_params(server_name: str) -> Optional[StdioServerParameters]:
-    """Gets StdioServerParameters for a named server from config."""
-    server_config = CONFIG.get("mcp_servers", {}).get(server_name)
-    if not server_config:
-        print(f"ERROR: MCP Server configuration '{server_name}' not found.")
-        return None
+# def get_mcp_server_params(server_name: str) -> Optional[StdioServerParameters]:
+#     """Gets StdioServerParameters for a named server from config."""
+#     server_config = CONFIG.get("mcp_servers", {}).get(server_name)
+#     if not server_config:
+#         print(f"ERROR: MCP Server configuration '{server_name}' not found.")
+#         return None
 
-    command = server_config.get("command")
-    args = server_config.get("args", [])
-    config_env_vars = server_config.get("env", {})
+#     command = server_config.get("command")
+#     args = server_config.get("args", [])
+#     config_env_vars = server_config.get("env", {})
 
-    if not command:
-        print(f"ERROR: 'command' missing in MCP server config for '{server_name}'.")
-        return None
+#     if not command:
+#         print(f"ERROR: 'command' missing in MCP server config for '{server_name}'.")
+#         return None
 
-    # Resolve environment variables, especially API keys like PERPLEXITY_API_KEY
-    processed_env = {}
-    for key, value in config_env_vars.items():
-        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
-            env_var_name = value[2:-1]
-            env_value = CONFIG.get(env_var_name.lower()) # Match keys in our main CONFIG
-            if env_value:
-                processed_env[key] = env_value
-            else:
-                print(f"Warning: Could not resolve env var '{env_var_name}' for MCP server '{server_name}'.")
-                # Keep original placeholder or set to empty string? Decide based on server needs.
-                processed_env[key] = "" # Setting to empty might be safer
-        else:
-            processed_env[key] = value
+#     # Resolve environment variables, especially API keys like PERPLEXITY_API_KEY
+#     processed_env = {}
+#     for key, value in config_env_vars.items():
+#         if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+#             env_var_name = value[2:-1]
+#             env_value = CONFIG.get(env_var_name.lower()) # Match keys in our main CONFIG
+#             if env_value:
+#                 processed_env[key] = env_value
+#             else:
+#                 print(f"Warning: Could not resolve env var '{env_var_name}' for MCP server '{server_name}'.")
+#                 # Keep original placeholder or set to empty string? Decide based on server needs.
+#                 processed_env[key] = "" # Setting to empty might be safer
+#         else:
+#             processed_env[key] = value
 
-    # Special handling for Docker '-e' arguments if needed (similar to mcp_client.py)
-    if command == "docker" and "-e" in args:
-        new_args = []
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg == "-e" and i + 1 < len(args):
-                env_key_in_arg = args[i+1]
-                # Ensure this env key was resolved and added to processed_env
-                if env_key_in_arg in processed_env:
-                    new_args.extend([arg, env_key_in_arg]) # Pass -e VAR_NAME
-                else:
-                     print(f"Warning: Env var '{env_key_in_arg}' specified in Docker args for '{server_name}' but not found/resolved in config.")
-                     # Decide whether to skip or pass '-e VAR_NAME' anyway
-                     # Skipping might be safer if the key is mandatory
-                i += 2 # Skip the key name
-            else:
-                new_args.append(arg)
-                i += 1
-        args = new_args
-        # Note: Docker daemon needs access to the resolved env vars passed via '-e'.
-        # The `processed_env` dict passed to StdioServerParameters is for the *mcp client process*,
-        # not necessarily the docker container directly unless command setup handles it.
+#     # Special handling for Docker '-e' arguments if needed (similar to mcp_client.py)
+#     if command == "docker" and "-e" in args:
+#         new_args = []
+#         i = 0
+#         while i < len(args):
+#             arg = args[i]
+#             if arg == "-e" and i + 1 < len(args):
+#                 env_key_in_arg = args[i+1]
+#                 # Ensure this env key was resolved and added to processed_env
+#                 if env_key_in_arg in processed_env:
+#                     new_args.extend([arg, env_key_in_arg]) # Pass -e VAR_NAME
+#                 else:
+#                      print(f"Warning: Env var '{env_key_in_arg}' specified in Docker args for '{server_name}' but not found/resolved in config.")
+#                      # Decide whether to skip or pass '-e VAR_NAME' anyway
+#                      # Skipping might be safer if the key is mandatory
+#                 i += 2 # Skip the key name
+#             else:
+#                 new_args.append(arg)
+#                 i += 1
+#         args = new_args
+#         # Note: Docker daemon needs access to the resolved env vars passed via '-e'.
+#         # The `processed_env` dict passed to StdioServerParameters is for the *mcp client process*,
+#         # not necessarily the docker container directly unless command setup handles it.
 
-    return StdioServerParameters(command=command, args=args, env=processed_env)
+#     return StdioServerParameters(command=command, args=args, env=processed_env)
 
 # --- Standard Helper Functions ---
 
